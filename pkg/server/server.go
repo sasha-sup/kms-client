@@ -10,9 +10,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"time"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -24,12 +27,14 @@ import (
 type Server struct {
 	kms.UnimplementedKMSServiceServer
 
+	logger *zap.Logger
 	getKey func(context.Context, string) ([]byte, error)
 }
 
 // NewServer initializes new server.
-func NewServer(keyHandler func(ctx context.Context, nodeUUID string) ([]byte, error)) *Server {
+func NewServer(logger *zap.Logger, keyHandler func(ctx context.Context, nodeUUID string) ([]byte, error)) *Server {
 	return &Server{
+		logger: logger,
 		getKey: keyHandler,
 	}
 }
@@ -40,6 +45,11 @@ func (srv *Server) Seal(ctx context.Context, req *kms.Request) (*kms.Response, e
 
 	key, err := srv.getKey(ctx, req.NodeUuid)
 	if err != nil {
+		srv.logger.Error("failed to get key for node, using random key",
+			zap.String("node_uuid", req.NodeUuid),
+			zap.Error(err),
+		)
+
 		key, err = getRandomAESKey()
 		if err != nil {
 			return nil, err
@@ -67,6 +77,11 @@ func (srv *Server) Seal(ctx context.Context, req *kms.Request) (*kms.Response, e
 
 	encrypted := aesgcm.Seal(nil, nonce, req.Data, nil)
 
+	srv.logger.Debug("sealed the data",
+		zap.String("node_uuid", req.NodeUuid),
+		zap.String("kcv", keyCheckValue(req.Data, req.NodeUuid)),
+	)
+
 	return &kms.Response{
 		Data: append(nonce, encrypted...), //nolint:makezero
 	}, nil
@@ -74,10 +89,19 @@ func (srv *Server) Seal(ctx context.Context, req *kms.Request) (*kms.Response, e
 
 // Unseal decrypts the incoming data.
 func (srv *Server) Unseal(ctx context.Context, req *kms.Request) (*kms.Response, error) {
-	time.Sleep(time.Second)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(time.Second):
+	}
 
 	key, err := srv.getKey(ctx, req.NodeUuid)
 	if err != nil {
+		srv.logger.Error("failed to get key for node, using random key",
+			zap.String("node_uuid", req.NodeUuid),
+			zap.Error(err),
+		)
+
 		key, err = getRandomAESKey()
 		if err != nil {
 			return nil, err
@@ -104,6 +128,11 @@ func (srv *Server) Unseal(ctx context.Context, req *kms.Request) (*kms.Response,
 
 	decrypted, err := aesgcm.Open(nil, req.Data[:nonceSize], req.Data[nonceSize:], nil)
 	if err != nil {
+		srv.logger.Error("failed to authenticate the data, using random data",
+			zap.String("node_uuid", req.NodeUuid),
+			zap.Error(err),
+		)
+
 		resp.Data = make([]byte, constants.PassphraseSize)
 
 		if _, err := io.ReadFull(rand.Reader, resp.Data); err != nil {
@@ -114,6 +143,11 @@ func (srv *Server) Unseal(ctx context.Context, req *kms.Request) (*kms.Response,
 	}
 
 	resp.Data = decrypted
+
+	srv.logger.Debug("unsealed the data",
+		zap.String("node_uuid", req.NodeUuid),
+		zap.String("kcv", keyCheckValue(resp.Data, req.NodeUuid)),
+	)
 
 	return resp, nil
 }
@@ -128,4 +162,18 @@ func getRandomAESKey() ([]byte, error) {
 	}
 
 	return key, nil
+}
+
+func keyCheckValue(key []byte, data string) string {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return ""
+	}
+
+	hash := sha256.Sum256([]byte(data))
+
+	encrypted := make([]byte, aes.BlockSize)
+	block.Encrypt(encrypted, hash[:aes.BlockSize])
+
+	return hex.EncodeToString(encrypted[:3])
 }

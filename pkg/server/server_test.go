@@ -12,26 +12,25 @@ import (
 	"io"
 	"testing"
 
-	"github.com/stretchr/testify/suite"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"github.com/siderolabs/kms-client/api/kms"
 	"github.com/siderolabs/kms-client/pkg/server"
 )
 
-type ServerSuite struct {
-	suite.Suite
-}
+func TestSealUnseal(t *testing.T) {
+	t.Parallel()
 
-func (suite *ServerSuite) TestSealUnseal() {
 	key, err := server.GetRandomAESKey()
-	suite.Require().NoError(err)
+	require.NoError(t, err)
 
 	passphrase := make([]byte, 32)
 
 	_, err = io.ReadFull(rand.Reader, passphrase)
-	suite.Require().NoError(err)
+	require.NoError(t, err)
 
-	srv := server.NewServer(func(_ context.Context, nodeUUID string) ([]byte, error) {
+	srv := server.NewServer(zaptest.NewLogger(t), func(_ context.Context, nodeUUID string) ([]byte, error) {
 		if nodeUUID != "abcd" {
 			return nil, fmt.Errorf("unknown node %s", nodeUUID)
 		}
@@ -39,43 +38,53 @@ func (suite *ServerSuite) TestSealUnseal() {
 		return key, nil
 	})
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	encrypted, err := srv.Seal(ctx, &kms.Request{
 		NodeUuid: "abcd",
 		Data:     passphrase,
 	})
-
-	suite.Require().NoError(err)
-	suite.Require().NotEmpty(encrypted.Data)
+	require.NoError(t, err)
+	require.NotEmpty(t, encrypted.Data)
 
 	decrypted, err := srv.Unseal(ctx, &kms.Request{
 		NodeUuid: "abcd",
 		Data:     encrypted.Data,
 	})
+	require.NoError(t, err)
+	require.Truef(t, bytes.Equal(passphrase, decrypted.Data), "expected %q to be equal to %q", passphrase, decrypted.Data)
 
-	suite.Require().NoError(err)
-	suite.Require().Truef(bytes.Equal(passphrase, decrypted.Data), "expected %q to be equal to %q", passphrase, decrypted.Data)
-
+	// wrong node uuid should not be able to decrypt the data
 	decrypted, err = srv.Unseal(ctx, &kms.Request{
 		NodeUuid: "abce",
 		Data:     encrypted.Data,
 	})
+	require.NoError(t, err)
+	require.Falsef(t, bytes.Equal(passphrase, decrypted.Data), "expected %q not to be equal to %q", passphrase, decrypted.Data)
 
-	suite.Require().NoError(err)
-	suite.Require().Falsef(bytes.Equal(passphrase, decrypted.Data), "expected %q not to be equal to %q", passphrase, decrypted.Data)
+	// randomly mutate the encrypted data, it should not be able to decrypt
+	encrypted.Data[0] ^= 0xFF
+
+	decrypted, err = srv.Unseal(ctx, &kms.Request{
+		NodeUuid: "abcd",
+		Data:     encrypted.Data,
+	})
+	require.NoError(t, err)
+	require.Falsef(t, bytes.Equal(passphrase, decrypted.Data), "expected %q not to be equal to %q", passphrase, decrypted.Data)
 }
 
-func (suite *ServerSuite) TestInvalidInputs() {
+func TestInvalidInputs(t *testing.T) {
+	t.Parallel()
+
 	key, err := server.GetRandomAESKey()
-	suite.Require().NoError(err)
+	require.NoError(t, err)
 
 	passphrase := make([]byte, 64)
 
 	_, err = io.ReadFull(rand.Reader, passphrase)
-	suite.Require().NoError(err)
+	require.NoError(t, err)
 
-	srv := server.NewServer(func(_ context.Context, nodeUUID string) ([]byte, error) {
+	srv := server.NewServer(zaptest.NewLogger(t), func(_ context.Context, nodeUUID string) ([]byte, error) {
 		if nodeUUID != "abcd" {
 			return nil, fmt.Errorf("unknown node %s", nodeUUID)
 		}
@@ -83,23 +92,19 @@ func (suite *ServerSuite) TestInvalidInputs() {
 		return key, nil
 	})
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err = srv.Seal(ctx, &kms.Request{
 		NodeUuid: "abcd",
 		Data:     passphrase,
 	})
 
-	suite.Require().Error(err)
+	require.Error(t, err)
 
 	_, err = srv.Unseal(ctx, &kms.Request{
 		NodeUuid: "abcd",
 		Data:     make([]byte, 0),
 	})
 
-	suite.Require().Error(err)
-}
-
-func TestServerSuite(t *testing.T) {
-	suite.Run(t, new(ServerSuite))
+	require.Error(t, err)
 }

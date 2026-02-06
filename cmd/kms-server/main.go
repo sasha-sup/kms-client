@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -47,6 +48,19 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	logger, err := zap.NewProduction()
+	if err != nil {
+		return fmt.Errorf("failed to create logger: %w", err)
+	}
+
+	defer logger.Sync() //nolint:errcheck
+
+	logger.Info("starting KMS server",
+		zap.String("apiEndpoint", kmsFlags.apiEndpoint),
+		zap.String("keyPath", kmsFlags.keyPath),
+		zap.Bool("tlsEnable", kmsFlags.tlsEnable),
+	)
+
 	if kmsFlags.keyPath == "" {
 		return fmt.Errorf("--key-path is not set")
 	}
@@ -56,7 +70,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	srv := server.NewServer(func(context.Context, string) ([]byte, error) { return key, nil })
+	srv := server.NewServer(logger, func(context.Context, string) ([]byte, error) { return key, nil })
 
 	var s *grpc.Server
 
@@ -75,7 +89,7 @@ func run(ctx context.Context) error {
 
 	kms.RegisterKMSServiceServer(s, srv)
 
-	lis, err := net.Listen("tcp", kmsFlags.apiEndpoint)
+	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", kmsFlags.apiEndpoint)
 	if err != nil {
 		return fmt.Errorf("error listening for gRPC API: %w", err)
 	}

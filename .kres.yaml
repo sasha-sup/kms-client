@@ -6,3 +6,7 @@ spec:
     - source: api/kms/kms.proto
       subdirectory: kms
 
+---
+kind: service.CodeCov
+spec:
+  targetThreshold: 10
