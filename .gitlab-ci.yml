@@ -1,0 +1,46 @@
+stages:
+  - verify
+  - build
+  - publish
+
+variables:
+  DOCKER_BUILDKIT: "1"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  GIT_DEPTH: "1"
+
+default:
+  image: docker:28.1.1-git
+  services:
+    - name: docker:28.1.1-dind
+  before_script:
+    - docker version
+    - docker buildx create --name gitlab-builder --use || docker buildx use gitlab-builder
+
+verify:
+  stage: verify
+  script:
+    - make lint-golangci-lint
+    - make unit-tests
+
+build:kms-server:
+  stage: build
+  script:
+    - make local-kms-server-linux-amd64 DEST=_out
+  artifacts:
+    name: "kms-server-${CI_COMMIT_SHA}"
+    expire_in: 1 week
+    paths:
+      - _out/kms-server-linux-amd64
+
+publish:kms-client-image:
+  stage: publish
+  needs:
+    - verify
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
+    - REGISTRY="$CI_REGISTRY" USERNAME="$CI_PROJECT_PATH" IMAGE_TAG="$CI_COMMIT_SHA" PUSH=true make registry-image-kms-client IMAGE_NAME="kms-client"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        REGISTRY="$CI_REGISTRY" USERNAME="$CI_PROJECT_PATH" IMAGE_TAG="latest" PUSH=true make registry-image-kms-client IMAGE_NAME="kms-client"
+      fi
