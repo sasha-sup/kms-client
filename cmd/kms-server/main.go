@@ -11,9 +11,14 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -24,19 +29,29 @@ import (
 )
 
 var kmsFlags struct {
-	apiEndpoint string
-	keyPath     string
-	tlsCertPath string
-	tlsKeyPath  string
-	tlsEnable   bool
+	apiEndpoint       string
+	keyPath           string
+	leaseStorePath    string
+	metricsEndpoint   string
+	tlsCertPath       string
+	tlsKeyPath        string
+	heartbeatInterval time.Duration
+	leaseDuration     time.Duration
+	heartbeatEnable   bool
+	tlsEnable         bool
 }
 
 func main() {
 	flag.StringVar(&kmsFlags.apiEndpoint, "kms-api-endpoint", ":4050", "gRPC API endpoint for the KMS")
+	flag.BoolVar(&kmsFlags.heartbeatEnable, "heartbeat-enable", false, "whether to enforce dead-man-switch heartbeat leases")
 	flag.StringVar(&kmsFlags.keyPath, "key-path", "", "encryption key path")
+	flag.StringVar(&kmsFlags.metricsEndpoint, "metrics-endpoint", ":2112", "HTTP endpoint for Prometheus metrics, empty to disable")
 	flag.BoolVar(&kmsFlags.tlsEnable, "tls-enable", false, "whether to enable tls or not")
-	flag.StringVar(&kmsFlags.tlsCertPath, "tls-cert-path", "", "encryption key path")
-	flag.StringVar(&kmsFlags.tlsKeyPath, "tls-key-path", "", "encryption key path")
+	flag.StringVar(&kmsFlags.tlsCertPath, "tls-cert-path", "", "TLS certificate path")
+	flag.StringVar(&kmsFlags.tlsKeyPath, "tls-key-path", "", "TLS key path")
+	flag.StringVar(&kmsFlags.leaseStorePath, "lease-store-path", "", "path to the persistent heartbeat lease store")
+	flag.DurationVar(&kmsFlags.heartbeatInterval, "heartbeat-interval", 0, "expected node heartbeat interval")
+	flag.DurationVar(&kmsFlags.leaseDuration, "lease-duration", 0, "node heartbeat lease duration")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -57,7 +72,12 @@ func run(ctx context.Context) error {
 
 	logger.Info("starting KMS server",
 		zap.String("apiEndpoint", kmsFlags.apiEndpoint),
+		zap.Bool("heartbeatEnable", kmsFlags.heartbeatEnable),
+		zap.Duration("heartbeatInterval", kmsFlags.heartbeatInterval),
 		zap.String("keyPath", kmsFlags.keyPath),
+		zap.Duration("leaseDuration", kmsFlags.leaseDuration),
+		zap.String("leaseStorePath", kmsFlags.leaseStorePath),
+		zap.String("metricsEndpoint", kmsFlags.metricsEndpoint),
 		zap.Bool("tlsEnable", kmsFlags.tlsEnable),
 	)
 
@@ -70,24 +90,27 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	srv := server.NewServer(logger, func(context.Context, string) ([]byte, error) { return key, nil })
+	metricsRegistry := prometheus.NewRegistry()
+	metricsRegistry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
 
-	var s *grpc.Server
+	metrics := server.NewMetrics(metricsRegistry)
 
-	if kmsFlags.tlsEnable {
-		var creds credentials.TransportCredentials
-
-		creds, err = credentials.NewServerTLSFromFile(kmsFlags.tlsCertPath, kmsFlags.tlsKeyPath)
-		if err != nil {
-			return fmt.Errorf("failed to create credentials: %w", err)
-		}
-
-		s = grpc.NewServer(grpc.Creds(creds))
-	} else {
-		s = grpc.NewServer()
+	options, err := serverOptions(metrics)
+	if err != nil {
+		return err
 	}
 
-	kms.RegisterKMSServiceServer(s, srv)
+	srv := server.NewServer(logger, func(context.Context, string) ([]byte, error) { return key, nil }, options)
+
+	grpcServer, err := newGRPCServer()
+	if err != nil {
+		return err
+	}
+
+	kms.RegisterKMSServiceServer(grpcServer, srv)
 
 	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", kmsFlags.apiEndpoint)
 	if err != nil {
@@ -97,20 +120,106 @@ func run(ctx context.Context) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
 	eg.Go(func() error {
-		return s.Serve(lis)
+		return grpcServer.Serve(lis)
 	})
 
 	eg.Go(func() error {
 		<-ctx.Done()
 
-		s.Stop()
+		grpcServer.Stop()
 
 		return nil
 	})
 
-	if err := eg.Wait(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+	if kmsFlags.metricsEndpoint != "" {
+		metricsServer := &http.Server{
+			Addr:              kmsFlags.metricsEndpoint,
+			Handler:           promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{}),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+
+		logger.Info("starting Prometheus metrics server",
+			zap.String("metricsEndpoint", kmsFlags.metricsEndpoint),
+		)
+
+		metricsListener, metricsErr := (&net.ListenConfig{}).Listen(ctx, "tcp", kmsFlags.metricsEndpoint)
+		if metricsErr != nil {
+			return fmt.Errorf("error listening for metrics API: %w", metricsErr)
+		}
+
+		eg.Go(func() error {
+			if serveErr := metricsServer.Serve(metricsListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				return serveErr
+			}
+
+			return nil
+		})
+
+		eg.Go(func() error {
+			<-ctx.Done()
+
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer shutdownCancel()
+
+			return metricsServer.Shutdown(shutdownCtx)
+		})
+	}
+
+	if err = eg.Wait(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 		return err
 	}
 
 	return nil
+}
+
+func newGRPCServer() (*grpc.Server, error) {
+	if !kmsFlags.tlsEnable {
+		return grpc.NewServer(), nil
+	}
+
+	creds, err := credentials.NewServerTLSFromFile(kmsFlags.tlsCertPath, kmsFlags.tlsKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create TLS credentials: %w", err)
+	}
+
+	return grpc.NewServer(grpc.Creds(creds)), nil
+}
+
+func serverOptions(metrics *server.Metrics) (server.Options, error) {
+	if !kmsFlags.heartbeatEnable {
+		if kmsFlags.heartbeatInterval > 0 || kmsFlags.leaseDuration > 0 || kmsFlags.leaseStorePath != "" {
+			return server.Options{}, fmt.Errorf("heartbeat lease flags require --heartbeat-enable")
+		}
+
+		return server.Options{
+			Metrics: metrics,
+		}, nil
+	}
+
+	if kmsFlags.leaseStorePath == "" {
+		return server.Options{}, fmt.Errorf("--lease-store-path is required when heartbeat leases are enabled")
+	}
+
+	if kmsFlags.heartbeatInterval <= 0 {
+		return server.Options{}, fmt.Errorf("--heartbeat-interval must be greater than zero when heartbeat leases are enabled")
+	}
+
+	if kmsFlags.leaseDuration <= 0 {
+		return server.Options{}, fmt.Errorf("--lease-duration must be greater than zero when heartbeat leases are enabled")
+	}
+
+	if kmsFlags.leaseDuration <= kmsFlags.heartbeatInterval {
+		return server.Options{}, fmt.Errorf("--lease-duration must be greater than --heartbeat-interval")
+	}
+
+	leaseStore, err := server.NewFileLeaseStore(kmsFlags.leaseStorePath, metrics)
+	if err != nil {
+		return server.Options{}, err
+	}
+
+	return server.Options{
+		LeaseStore:    leaseStore,
+		Metrics:       metrics,
+		LeaseDuration: kmsFlags.leaseDuration,
+	}, nil
 }

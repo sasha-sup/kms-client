@@ -6,14 +6,15 @@ option go_package = "github.com/siderolabs/kms/api/kms";
 
 // KMSService provides APIs to encrypt and decrypt data.
 service KMSService {
+  rpc Heartbeat(Request) returns (Response);
   rpc Seal(Request) returns (Response);
   rpc Unseal(Request) returns (Response);
 }
 
 message Request {
-  // Node UUID as string.
+  // Node UUID as string. Heartbeat requests resolve node identity server-side and may leave it empty.
   string node_uuid = 1;
-  // Data to encrypt or decrypt.
+  // Data to encrypt or decrypt. Heartbeat does not use it.
   bytes data = 2;
 }
 

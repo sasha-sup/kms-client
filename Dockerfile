@@ -159,3 +159,26 @@ COPY --from=image-ca-certificates / /
 LABEL org.opencontainers.image.source=https://github.com/siderolabs/kms-client
 ENTRYPOINT ["/kms-server"]
 
+# builds kms-client-linux-amd64
+FROM base AS kms-client-linux-amd64-build
+COPY --from=generate / /
+WORKDIR /src/cmd/kms-client
+ARG GO_BUILDFLAGS
+ARG GO_LDFLAGS
+RUN --mount=type=cache,target=/root/.cache/go-build,id=kms-client/root/.cache/go-build --mount=type=cache,target=/go/pkg,id=kms-client/go/pkg go build ${GO_BUILDFLAGS} -ldflags "${GO_LDFLAGS}" -o /kms-client-linux-amd64
+
+FROM scratch AS kms-client-linux-amd64
+COPY --from=kms-client-linux-amd64-build /kms-client-linux-amd64 /kms-client-linux-amd64
+
+FROM kms-client-linux-${TARGETARCH} AS kms-client
+
+FROM scratch AS kms-client-all
+COPY --from=kms-client-linux-amd64 / /
+
+FROM scratch AS image-kms-client
+ARG TARGETARCH
+COPY --from=kms-client kms-client-linux-${TARGETARCH} /kms-client
+COPY --from=image-fhs / /
+COPY --from=image-ca-certificates / /
+LABEL org.opencontainers.image.source=https://github.com/siderolabs/kms-client
+ENTRYPOINT ["/kms-client"]
