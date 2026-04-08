@@ -21,6 +21,8 @@ var (
 	ErrLeaseNotFound = errors.New("lease not found")
 	// ErrNodeIPNotFound is returned when no node is registered for an observed peer IP.
 	ErrNodeIPNotFound = errors.New("node IP not found")
+	// ErrLeaseBlocked is returned when a node has been blocked by the dead-man's switch.
+	ErrLeaseBlocked = errors.New("node blocked")
 )
 
 // LeaseStatus tracks the persisted dead-man-switch state for a node.
@@ -29,6 +31,7 @@ type LeaseStatus string
 const (
 	LeaseStatusActive  LeaseStatus = "active"
 	LeaseStatusExpired LeaseStatus = "expired"
+	LeaseStatusBlocked LeaseStatus = "blocked"
 )
 
 // LeaseRecord stores the persisted heartbeat state for a node.
@@ -38,6 +41,10 @@ type LeaseRecord struct {
 	LastUnsealAt    time.Time   `json:"last_unseal_at"`
 	LastUnsealIP    string      `json:"last_unseal_ip"`
 	Status          LeaseStatus `json:"status"`
+	FirstSeen       time.Time   `json:"first_seen,omitempty"`
+	NodeIP          string      `json:"node_ip,omitempty"`
+	BlockedAt       time.Time   `json:"blocked_at,omitempty"`
+	BlockReason     string      `json:"block_reason,omitempty"`
 }
 
 type leaseStoreFile struct {
@@ -81,6 +88,13 @@ func (store *LeaseStore) Bootstrap(nodeUUID, peerIP string, now time.Time, lease
 	record := activeLease(now.UTC(), leaseDuration)
 	record.LastUnsealAt = now.UTC()
 	record.LastUnsealIP = peerIP
+	record.NodeIP = peerIP
+
+	if existing, ok := store.nodes[nodeUUID]; ok {
+		record.FirstSeen = existing.FirstSeen
+	} else {
+		record.FirstSeen = now.UTC()
+	}
 
 	for existingNodeUUID, existingRecord := range store.nodes {
 		if existingNodeUUID == nodeUUID || existingRecord.LastUnsealIP != peerIP {
@@ -108,6 +122,10 @@ func (store *LeaseStore) HeartbeatByIP(peerIP string, now time.Time, leaseDurati
 	}
 
 	now = now.UTC()
+
+	if record.Status == LeaseStatusBlocked {
+		return nodeUUID, record, ErrLeaseBlocked
+	}
 
 	if record.isExpired(now) || record.Status == LeaseStatusExpired {
 		record.Status = LeaseStatusExpired
@@ -142,6 +160,10 @@ func (store *LeaseStore) Validate(nodeUUID string, now time.Time) (LeaseRecord, 
 
 	now = now.UTC()
 
+	if record.Status == LeaseStatusBlocked {
+		return record, ErrLeaseBlocked
+	}
+
 	if record.isExpired(now) || record.Status == LeaseStatusExpired {
 		record.Status = LeaseStatusExpired
 		store.nodes[nodeUUID] = record
@@ -165,6 +187,115 @@ func (store *LeaseStore) Get(nodeUUID string) (LeaseRecord, bool, error) {
 	record, ok := store.nodes[nodeUUID]
 
 	return record, ok, nil
+}
+
+// HeartbeatByUUID refreshes the lease for a node identified by UUID directly (used by HTTP heartbeat).
+func (store *LeaseStore) HeartbeatByUUID(nodeUUID, nodeIP string, now time.Time, leaseDuration time.Duration) (LeaseRecord, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	now = now.UTC()
+
+	record, ok := store.nodes[nodeUUID]
+	if !ok {
+		record = LeaseRecord{
+			FirstSeen:       now,
+			NodeIP:          nodeIP,
+			LastHeartbeatAt: now,
+			LeaseUntil:      now.Add(leaseDuration),
+			Status:          LeaseStatusActive,
+		}
+		store.nodes[nodeUUID] = record
+		store.updateLeaseMetricsLocked(now)
+
+		return record, store.persistLocked()
+	}
+
+	if record.Status == LeaseStatusBlocked {
+		return record, ErrLeaseBlocked
+	}
+
+	record.LastHeartbeatAt = now
+	record.LeaseUntil = now.Add(leaseDuration)
+	record.NodeIP = nodeIP
+	record.Status = LeaseStatusActive
+	store.nodes[nodeUUID] = record
+	store.updateLeaseMetricsLocked(now)
+
+	return record, store.persistLocked()
+}
+
+// ListAll returns a copy of all node records.
+func (store *LeaseStore) ListAll() map[string]LeaseRecord {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	result := make(map[string]LeaseRecord, len(store.nodes))
+	for k, v := range store.nodes {
+		result[k] = v
+	}
+
+	return result
+}
+
+// Unblock resets a blocked node back to active with a fresh lease.
+func (store *LeaseStore) Unblock(nodeUUID string, now time.Time, leaseDuration time.Duration) (LeaseRecord, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	record, ok := store.nodes[nodeUUID]
+	if !ok {
+		return LeaseRecord{}, ErrLeaseNotFound
+	}
+
+	now = now.UTC()
+	record.Status = LeaseStatusActive
+	record.BlockedAt = time.Time{}
+	record.BlockReason = ""
+	record.LastHeartbeatAt = now
+	record.LeaseUntil = now.Add(leaseDuration)
+	store.nodes[nodeUUID] = record
+	store.updateLeaseMetricsLocked(now)
+
+	return record, store.persistLocked()
+}
+
+// BlockExpiredNodes checks all active nodes and blocks those whose heartbeat
+// has exceeded the timeout. Returns the list of newly blocked node UUIDs.
+func (store *LeaseStore) BlockExpiredNodes(now time.Time, heartbeatTimeout time.Duration) []string {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	now = now.UTC()
+
+	var blocked []string
+
+	for nodeUUID, record := range store.nodes {
+		if record.Status != LeaseStatusActive {
+			continue
+		}
+
+		if record.LastHeartbeatAt.IsZero() {
+			continue
+		}
+
+		if now.Sub(record.LastHeartbeatAt) <= heartbeatTimeout {
+			continue
+		}
+
+		record.Status = LeaseStatusBlocked
+		record.BlockedAt = now
+		record.BlockReason = "heartbeat_timeout"
+		store.nodes[nodeUUID] = record
+		blocked = append(blocked, nodeUUID)
+	}
+
+	if len(blocked) > 0 {
+		store.updateLeaseMetricsLocked(now)
+		_ = store.persistLocked()
+	}
+
+	return blocked
 }
 
 func (store *LeaseStore) recordByIPLocked(peerIP string) (string, LeaseRecord, bool) {
@@ -254,7 +385,7 @@ func (store *LeaseStore) updateLeaseMetricsLocked(now time.Time) {
 	expired := 0
 
 	for _, record := range store.nodes {
-		if record.Status == LeaseStatusExpired || record.isExpired(now) {
+		if record.Status == LeaseStatusBlocked || record.Status == LeaseStatusExpired || record.isExpired(now) {
 			expired++
 		} else {
 			active++

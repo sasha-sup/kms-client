@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kms-agent
+  labels:
+    app: kms-agent
+rules: []
+# The agent does not need any Kubernetes API access — it only sends HTTP
+# heartbeats to the KMS server. An empty rule set ensures least privilege.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kms-agent
+  labels:
+    app: kms-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kms-agent
+subjects:
+  - kind: ServiceAccount
+    name: kms-agent
+    namespace: kms-system

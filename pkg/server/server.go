@@ -138,6 +138,14 @@ func (srv *Server) Heartbeat(ctx context.Context, _ *kms.Request) (_ *kms.Respon
 	nodeUUID, leaseRecord, err := srv.leaseStore.HeartbeatByIP(peerIP, srv.now(), srv.leaseWindow)
 	if err != nil {
 		switch {
+		case errors.Is(err, ErrLeaseBlocked):
+			srv.logger.Warn("rejected heartbeat for blocked node",
+				zap.String("peer_ip", peerIP),
+				zap.String("node_uuid", nodeUUID),
+				zap.String("block_reason", leaseRecord.BlockReason),
+			)
+
+			return nil, status.Error(codes.PermissionDenied, "node blocked")
 		case errors.Is(err, ErrLeaseExpired):
 			srv.logger.Warn("rejected heartbeat for expired lease",
 				zap.String("peer_ip", peerIP),
@@ -301,6 +309,16 @@ func (srv *Server) validateLease(nodeUUID string) error {
 	leaseRecord, err := srv.leaseStore.Validate(nodeUUID, srv.now())
 	if err == nil {
 		return nil
+	}
+
+	if errors.Is(err, ErrLeaseBlocked) {
+		srv.logger.Warn("denied unseal because node is blocked",
+			zap.String("node_uuid", nodeUUID),
+			zap.String("block_reason", leaseRecord.BlockReason),
+			zap.Time("blocked_at", leaseRecord.BlockedAt),
+		)
+
+		return status.Error(codes.PermissionDenied, "node blocked")
 	}
 
 	if errors.Is(err, ErrLeaseNotFound) {

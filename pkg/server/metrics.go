@@ -20,12 +20,13 @@ const (
 
 // Metrics provides Prometheus metrics for the KMS server.
 type Metrics struct {
-	unsealRequests   *prometheus.CounterVec
-	heartbeatRequest *prometheus.CounterVec
-	requestDuration  *prometheus.HistogramVec
-	activeLeases     prometheus.Gauge
-	expiredLeases    prometheus.Gauge
-	leaseStoreErrors *prometheus.CounterVec
+	unsealRequests      *prometheus.CounterVec
+	heartbeatRequest    *prometheus.CounterVec
+	requestDuration     *prometheus.HistogramVec
+	activeLeases        prometheus.Gauge
+	expiredLeases       prometheus.Gauge
+	leaseStoreErrors    *prometheus.CounterVec
+	heartbeatTimeouts   prometheus.Counter
 }
 
 // NewMetrics initializes KMS Prometheus metrics.
@@ -56,6 +57,10 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 			Name: "kms_lease_store_errors_total",
 			Help: "Total number of lease store persistence errors grouped by operation.",
 		}, []string{"operation"}),
+		heartbeatTimeouts: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kms_heartbeat_timeouts_total",
+			Help: "Total number of nodes blocked due to heartbeat timeout.",
+		}),
 	}
 
 	registerer.MustRegister(
@@ -65,6 +70,7 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 		metrics.activeLeases,
 		metrics.expiredLeases,
 		metrics.leaseStoreErrors,
+		metrics.heartbeatTimeouts,
 	)
 
 	return metrics
@@ -99,6 +105,14 @@ func (metrics *Metrics) setLeaseCounts(active, expired int) {
 	metrics.expiredLeases.Set(float64(expired))
 }
 
+func (metrics *Metrics) incHeartbeatTimeouts(count int) {
+	if metrics == nil {
+		return
+	}
+
+	metrics.heartbeatTimeouts.Add(float64(count))
+}
+
 func (metrics *Metrics) incLeaseStoreError(operation string) {
 	if metrics == nil {
 		return
@@ -119,6 +133,8 @@ func requestLabels(err error) (string, string) {
 
 	if st.Code() == codes.PermissionDenied {
 		switch {
+		case strings.Contains(st.Message(), "blocked"):
+			return requestResultDenied, "node_blocked"
 		case strings.Contains(st.Message(), "expired"):
 			return requestResultDenied, "lease_expired"
 		case strings.Contains(st.Message(), "missing"):

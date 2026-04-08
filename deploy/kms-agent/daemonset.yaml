@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kms-agent
+  namespace: kms-system
+  labels:
+    app: kms-agent
+spec:
+  selector:
+    matchLabels:
+      app: kms-agent
+  template:
+    metadata:
+      labels:
+        app: kms-agent
+    spec:
+      serviceAccountName: kms-agent
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: kms-agent
+          image: ghcr.io/siderolabs/kms-agent:latest
+          env:
+            # spec.nodeName is used as NODE_UUID.
+            # On Talos Linux the node name matches the machine UUID
+            # exposed via /sys/class/dmi/id/product_uuid when the node
+            # is registered with its machine UUID. If a different UUID
+            # source is required, replace the fieldRef below with the
+            # appropriate value (e.g., from a machine config annotation).
+            - name: NODE_UUID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KMS_SERVER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: kms-agent-config
+                  key: kms-server-url
+            - name: HEARTBEAT_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: kms-agent-config
+                  key: heartbeat-interval
+            - name: HEARTBEAT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kms-agent-secret
+                  key: hmac-key
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

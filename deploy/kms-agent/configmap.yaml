@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kms-agent-config
+  namespace: kms-system
+data:
+  kms-server-url: "http://kms-server.kms-system.svc.cluster.local:4051"
+  heartbeat-interval: "30s"

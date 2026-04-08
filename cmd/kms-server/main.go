@@ -29,20 +29,26 @@ import (
 )
 
 var kmsFlags struct {
-	apiEndpoint       string
-	keyPath           string
-	leaseStorePath    string
-	metricsEndpoint   string
-	tlsCertPath       string
-	tlsKeyPath        string
-	heartbeatInterval time.Duration
-	leaseDuration     time.Duration
-	heartbeatEnable   bool
-	tlsEnable         bool
+	apiEndpoint        string
+	httpEndpoint       string
+	keyPath            string
+	leaseStorePath     string
+	metricsEndpoint    string
+	tlsCertPath        string
+	tlsKeyPath         string
+	heartbeatInterval  time.Duration
+	heartbeatTimeout   time.Duration
+	heartbeatCheckInterval time.Duration
+	leaseDuration      time.Duration
+	heartbeatHMACKey   string
+	adminToken         string
+	heartbeatEnable    bool
+	tlsEnable          bool
 }
 
 func main() {
 	flag.StringVar(&kmsFlags.apiEndpoint, "kms-api-endpoint", ":4050", "gRPC API endpoint for the KMS")
+	flag.StringVar(&kmsFlags.httpEndpoint, "http-endpoint", ":4051", "HTTP API endpoint for heartbeat and admin")
 	flag.BoolVar(&kmsFlags.heartbeatEnable, "heartbeat-enable", false, "whether to enforce dead-man-switch heartbeat leases")
 	flag.StringVar(&kmsFlags.keyPath, "key-path", "", "encryption key path")
 	flag.StringVar(&kmsFlags.metricsEndpoint, "metrics-endpoint", ":2112", "HTTP endpoint for Prometheus metrics, empty to disable")
@@ -50,9 +56,19 @@ func main() {
 	flag.StringVar(&kmsFlags.tlsCertPath, "tls-cert-path", "", "TLS certificate path")
 	flag.StringVar(&kmsFlags.tlsKeyPath, "tls-key-path", "", "TLS key path")
 	flag.StringVar(&kmsFlags.leaseStorePath, "lease-store-path", "", "path to the persistent heartbeat lease store")
-	flag.DurationVar(&kmsFlags.heartbeatInterval, "heartbeat-interval", 0, "expected node heartbeat interval")
+	flag.DurationVar(&kmsFlags.heartbeatInterval, "heartbeat-interval", 30*time.Second, "expected node heartbeat interval")
+	flag.DurationVar(&kmsFlags.heartbeatTimeout, "heartbeat-timeout", 120*time.Second, "seconds without heartbeat before blocking a node")
+	flag.DurationVar(&kmsFlags.heartbeatCheckInterval, "heartbeat-check-interval", 30*time.Second, "how often the server checks for heartbeat timeouts")
 	flag.DurationVar(&kmsFlags.leaseDuration, "lease-duration", 0, "node heartbeat lease duration")
 	flag.Parse()
+
+	if envKey := os.Getenv("HEARTBEAT_HMAC_KEY"); envKey != "" {
+		kmsFlags.heartbeatHMACKey = envKey
+	}
+
+	if envToken := os.Getenv("ADMIN_TOKEN"); envToken != "" {
+		kmsFlags.adminToken = envToken
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -72,8 +88,11 @@ func run(ctx context.Context) error {
 
 	logger.Info("starting KMS server",
 		zap.String("apiEndpoint", kmsFlags.apiEndpoint),
+		zap.String("httpEndpoint", kmsFlags.httpEndpoint),
 		zap.Bool("heartbeatEnable", kmsFlags.heartbeatEnable),
 		zap.Duration("heartbeatInterval", kmsFlags.heartbeatInterval),
+		zap.Duration("heartbeatTimeout", kmsFlags.heartbeatTimeout),
+		zap.Duration("heartbeatCheckInterval", kmsFlags.heartbeatCheckInterval),
 		zap.String("keyPath", kmsFlags.keyPath),
 		zap.Duration("leaseDuration", kmsFlags.leaseDuration),
 		zap.String("leaseStorePath", kmsFlags.leaseStorePath),
@@ -165,6 +184,65 @@ func run(ctx context.Context) error {
 		})
 	}
 
+	if kmsFlags.heartbeatEnable && kmsFlags.heartbeatHMACKey != "" && kmsFlags.adminToken != "" {
+		httpHandler := server.NewHTTPHandler(server.HTTPHandlerOptions{
+			LeaseStore:        options.LeaseStore,
+			HMACAuth:          server.NewHMACAuth(kmsFlags.heartbeatHMACKey),
+			AdminToken:        kmsFlags.adminToken,
+			Logger:            logger,
+			Metrics:           metrics,
+			LeaseDuration:     kmsFlags.leaseDuration,
+			HeartbeatInterval: kmsFlags.heartbeatInterval,
+		})
+
+		mux := http.NewServeMux()
+		httpHandler.RegisterRoutes(mux)
+
+		httpServer := &http.Server{
+			Addr:              kmsFlags.httpEndpoint,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+
+		httpListener, httpErr := (&net.ListenConfig{}).Listen(ctx, "tcp", kmsFlags.httpEndpoint)
+		if httpErr != nil {
+			return fmt.Errorf("error listening for HTTP API: %w", httpErr)
+		}
+
+		logger.Info("starting HTTP API server",
+			zap.String("httpEndpoint", kmsFlags.httpEndpoint),
+		)
+
+		eg.Go(func() error {
+			if serveErr := httpServer.Serve(httpListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				return serveErr
+			}
+
+			return nil
+		})
+
+		eg.Go(func() error {
+			<-ctx.Done()
+
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer shutdownCancel()
+
+			return httpServer.Shutdown(shutdownCtx)
+		})
+
+		dms := server.NewDeadManSwitch(server.DeadManSwitchOptions{
+			LeaseStore:       options.LeaseStore,
+			Logger:           logger,
+			Metrics:          metrics,
+			CheckInterval:    kmsFlags.heartbeatCheckInterval,
+			HeartbeatTimeout: kmsFlags.heartbeatTimeout,
+		})
+
+		eg.Go(func() error {
+			return dms.Run(ctx)
+		})
+	}
+
 	if err = eg.Wait(); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 		return err
 	}
@@ -187,8 +265,8 @@ func newGRPCServer() (*grpc.Server, error) {
 
 func serverOptions(metrics *server.Metrics) (server.Options, error) {
 	if !kmsFlags.heartbeatEnable {
-		if kmsFlags.heartbeatInterval > 0 || kmsFlags.leaseDuration > 0 || kmsFlags.leaseStorePath != "" {
-			return server.Options{}, fmt.Errorf("heartbeat lease flags require --heartbeat-enable")
+		if kmsFlags.leaseDuration > 0 || kmsFlags.leaseStorePath != "" {
+			return server.Options{}, fmt.Errorf("--lease-duration and --lease-store-path require --heartbeat-enable")
 		}
 
 		return server.Options{
