@@ -20,6 +20,7 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -351,6 +352,15 @@ func validateNodeUUID(req *kms.Request) error {
 }
 
 func peerIPFromContext(ctx context.Context) (string, error) {
+	// Check X-Real-IP from gRPC metadata first (set by reverse proxy).
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get("x-real-ip"); len(vals) > 0 {
+			if ip := net.ParseIP(vals[0]); ip != nil {
+				return ip.String(), nil
+			}
+		}
+	}
+
 	p, ok := peer.FromContext(ctx)
 	if !ok || p.Addr == nil {
 		return "", fmt.Errorf("missing peer information")

@@ -307,6 +307,131 @@ func TestIdentifyRejects401WithoutSignature(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+func TestAdminSetMaintenanceWithoutTokenReturns401(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	mux, store := newTestHTTPHandler(t, func() time.Time { return now })
+
+	_, err := store.Bootstrap("node-1", "10.0.0.1", now, 5*time.Minute)
+	require.NoError(t, err)
+
+	body, err := json.Marshal(map[string]any{"enabled": true})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/nodes/node-1/maintenance", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestAdminSetMaintenanceEnableDisable(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	mux, store := newTestHTTPHandler(t, func() time.Time { return now })
+
+	_, err := store.Bootstrap("node-1", "10.0.0.1", now, 5*time.Minute)
+	require.NoError(t, err)
+
+	// Enable maintenance.
+	body, err := json.Marshal(map[string]any{"enabled": true})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/nodes/node-1/maintenance", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	record, ok, err := store.Get("node-1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, record.Maintenance)
+	require.False(t, record.MaintenanceAt.IsZero())
+
+	// Disable maintenance.
+	body, err = json.Marshal(map[string]any{"enabled": false})
+	require.NoError(t, err)
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/nodes/node-1/maintenance", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	record, ok, err = store.Get("node-1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, record.Maintenance)
+	require.True(t, record.MaintenanceAt.IsZero())
+}
+
+func TestMaintenanceNodeNotBlockedByDeadManSwitch(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	mux, store := newTestHTTPHandler(t, func() time.Time { return now })
+
+	_, err := store.Bootstrap("node-1", "10.0.0.1", now, 5*time.Minute)
+	require.NoError(t, err)
+
+	// Enable maintenance via admin API.
+	body, err := json.Marshal(map[string]any{"enabled": true})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/nodes/node-1/maintenance", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// Advance time past heartbeat timeout.
+	now = now.Add(130 * time.Second)
+	blocked := store.BlockExpiredNodes(now, 120*time.Second)
+
+	// Node should NOT be blocked because it's in maintenance mode.
+	require.Empty(t, blocked)
+
+	record, ok, err := store.Get("node-1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, server.LeaseStatusActive, record.Status)
+	require.True(t, record.Maintenance)
+}
+
+func TestMaintenanceNodeListShowsMaintenanceField(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	mux, store := newTestHTTPHandler(t, func() time.Time { return now })
+
+	_, err := store.Bootstrap("node-1", "10.0.0.1", now, 5*time.Minute)
+	require.NoError(t, err)
+
+	_, err = store.SetMaintenance("node-1", true, now, 5*time.Minute)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/nodes", nil)
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var nodes []map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &nodes))
+	require.Len(t, nodes, 1)
+	require.Equal(t, true, nodes[0]["maintenance"])
+}
+
 func makeHeartbeatBody(t *testing.T, nodeUUID, nodeIP string, timestamp int64) []byte {
 	t.Helper()
 

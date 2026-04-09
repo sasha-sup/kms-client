@@ -4,4 +4,7 @@
 
 package server
 
-var GetRandomAESKey = getRandomAESKey
+var (
+	GetRandomAESKey   = getRandomAESKey
+	PeerIPFromContext = peerIPFromContext
+)

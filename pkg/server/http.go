@@ -63,6 +63,7 @@ func (h *HTTPHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /node/identify", h.handleIdentify)
 	mux.HandleFunc("GET /admin/nodes", h.handleListNodes)
 	mux.HandleFunc("POST /admin/nodes/{uuid}/unblock", h.handleUnblockNode)
+	mux.HandleFunc("POST /admin/nodes/{uuid}/maintenance", h.handleSetMaintenance)
 }
 
 type identifyRequest struct {
@@ -78,6 +79,7 @@ type identifyResponse struct {
 type heartbeatRequest struct {
 	NodeUUID  string `json:"node_uuid"`
 	NodeIP    string `json:"node_ip"`
+	Hostname  string `json:"hostname,omitempty"`
 	Timestamp int64  `json:"timestamp"`
 }
 
@@ -92,13 +94,16 @@ type errorResponse struct {
 }
 
 type nodeResponse struct {
-	UUID          string     `json:"uuid"`
-	IP            string     `json:"ip"`
-	Status        string     `json:"status"`
 	FirstSeen     *time.Time `json:"first_seen,omitempty"`
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
 	BlockedAt     *time.Time `json:"blocked_at,omitempty"`
+	MaintenanceAt *time.Time `json:"maintenance_at,omitempty"`
+	UUID          string     `json:"uuid"`
+	IP            string     `json:"ip"`
+	Hostname      string     `json:"hostname,omitempty"`
+	Status        string     `json:"status"`
 	BlockReason   string     `json:"block_reason,omitempty"`
+	Maintenance   bool       `json:"maintenance"`
 }
 
 func (h *HTTPHandler) handleIdentify(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +182,7 @@ func (h *HTTPHandler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	record, err := h.leaseStore.HeartbeatByUUID(req.NodeUUID, req.NodeIP, h.now(), h.leaseDuration)
+	record, err := h.leaseStore.HeartbeatByUUID(req.NodeUUID, req.NodeIP, req.Hostname, h.now(), h.leaseDuration)
 	if err != nil {
 		if errors.Is(err, ErrLeaseBlocked) {
 			h.logger.Warn("rejected HTTP heartbeat for blocked node",
@@ -227,9 +232,10 @@ func (h *HTTPHandler) handleListNodes(w http.ResponseWriter, r *http.Request) {
 
 	for uuid, record := range nodes {
 		nr := nodeResponse{
-			UUID:   uuid,
-			IP:     record.NodeIP,
-			Status: string(record.Status),
+			UUID:     uuid,
+			IP:       record.NodeIP,
+			Hostname: record.Hostname,
+			Status:   string(record.Status),
 		}
 
 		if !record.FirstSeen.IsZero() {
@@ -248,6 +254,13 @@ func (h *HTTPHandler) handleListNodes(w http.ResponseWriter, r *http.Request) {
 		}
 
 		nr.BlockReason = record.BlockReason
+		nr.Maintenance = record.Maintenance
+
+		if !record.MaintenanceAt.IsZero() {
+			t := record.MaintenanceAt
+			nr.MaintenanceAt = &t
+		}
+
 		result = append(result, nr)
 	}
 
@@ -296,6 +309,59 @@ func (h *HTTPHandler) handleUnblockNode(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (h *HTTPHandler) handleSetMaintenance(w http.ResponseWriter, r *http.Request) {
+	if !h.authenticateAdmin(r) {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid_admin_token"})
+
+		return
+	}
+
+	uuid := r.PathValue("uuid")
+	if uuid == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing_uuid"})
+
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid_request"})
+
+		return
+	}
+
+	record, err := h.leaseStore.SetMaintenance(uuid, req.Enabled, h.now(), h.leaseDuration)
+	if err != nil {
+		if errors.Is(err, ErrLeaseNotFound) {
+			writeJSON(w, http.StatusNotFound, errorResponse{Error: "node_not_found"})
+
+			return
+		}
+
+		h.logger.Error("failed to set maintenance mode",
+			zap.String("node_uuid", uuid),
+			zap.Bool("enabled", req.Enabled),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal_error"})
+
+		return
+	}
+
+	h.logger.Info("node maintenance mode changed",
+		zap.String("node_uuid", uuid),
+		zap.Bool("maintenance", req.Enabled),
+	)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"uuid":        uuid,
+		"maintenance": record.Maintenance,
+	})
+}
+
 func (h *HTTPHandler) authenticateAdmin(r *http.Request) bool {
 	token := r.Header.Get("Authorization")
 	token = strings.TrimPrefix(token, "Bearer ")
@@ -304,17 +370,7 @@ func (h *HTTPHandler) authenticateAdmin(r *http.Request) bool {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
-	body, err := json.Marshal(v)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-
-	if _, err = w.Write(append(body, '\n')); err != nil {
-		return
-	}
+	json.NewEncoder(w).Encode(v) //nolint:errcheck,errchkjson
 }

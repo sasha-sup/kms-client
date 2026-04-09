@@ -1,0 +1,349 @@
+h1. KMS Client
+
+Сервер управления ключами шифрования дисков (LUKS) для Talos Linux с механизмом Dead Man's Switch для автоматической блокировки узлов.
+
+h2. Компоненты
+
+||Компонент||Описание||Расположение||
+|*kms-server*|gRPC-сервер Seal/Unseal + HTTP API heartbeat/admin|{{cmd/kms-server/}}|
+|*kms-agent*|HTTP heartbeat-агент (Kubernetes DaemonSet)|{{cmd/kms-agent/}}|
+
+h2. Архитектура
+
+{code}
+┌─────────────┐    gRPC (Unseal)     ┌───────────┐
+│  Talos Node  │ ──────────────────> │  nginx    │
+│  (boot)      │                     │  (TLS)    │
+└─────────────┘                      └─────┬─────┘
+                                           │ grpc://127.0.0.1:4443
+┌─────────────┐   POST /heartbeat    ┌─────▼─────┐
+│  kms-agent   │ ──────────────────> │           │
+│  (DaemonSet) │   HMAC-SHA256       │ kms-server│
+└─────────────┘                      └───────────┘
+{code}
+
+h3. Порядок работы
+
+# *Нода загружается* — Talos обращается к KMS серверу за расшифровкой LUKS ({{Unseal}}). Сервер регистрирует ноду ({{node_uuid}} + {{node_ip}}) и выдаёт ключ.
+# *Kubernetes стартует* — kms-agent (DaemonSet) обращается на {{POST /node/identify}} со своим IP. Сервер находит ноду по IP и возвращает {{node_uuid}}.
+# Каждые {{HEARTBEAT_INTERVAL}} секунд агент отправляет подписанный HMAC-SHA256 запрос на {{POST /heartbeat}}.
+# Фоновая горутина (Dead Man's Switch) каждые {{HEARTBEAT_CHECK_INTERVAL}} проверяет все активные узлы.
+# Если узел не отправил heartbeat дольше {{HEARTBEAT_TIMEOUT}} — статус меняется на {{blocked}}.
+# Заблокированный узел *не может* получить ключ через {{Unseal}}.
+# Разблокировка — только через admin API.
+# Перед обслуживанием узла оператор может включить *maintenance mode* — Dead Man's Switch не заблокирует узел при отсутствии heartbeat.
+
+h3. Nginx Reverse Proxy
+
+KMS-сервер работает за nginx, который терминирует TLS и проксирует gRPC. Nginx передаёт заголовок {{X-Real-IP}}, а сервер извлекает реальный IP узла из gRPC metadata (с fallback на peer address). Конфигурация разворачивается через Ansible-роль [talos-kms|https://gl.pypypy.py/devops/iac/-/tree/main/ansible/roles/talos-kms].
+
+h2. Мониторинг (Grafana)
+
+
+
+Дашборд обновляется каждые 30 секунд, источник данных — VictoriaMetrics. Переменные фильтрации: {{job}}, {{instance}}.
+
+h3. Панели
+
+||Панель||Тип||Что показывает||Метрика||
+|*KMS Up*|stat|Доступность KMS-сервера (Up/Down)|{{up\{job=~"$job"\}}}|
+|*Active Leases*|stat|Количество активных lease (выданных ключей)|{{kms_active_leases}}|
+|*Expired Leases*|stat|Количество истёкших lease|{{kms_expired_leases}}|
+|*Timeout Blocks Total*|stat|Общее число блокировок по таймауту heartbeat|{{kms_heartbeat_timeouts_total}}|
+|*Lease Store Errors*|stat|Ошибки хранилища lease за интервал|{{kms_lease_store_errors_total}}|
+|*Lease State*|timeseries|История active vs expired lease во времени|{{kms_active_leases}}, {{kms_expired_leases}}|
+|*Heartbeat Requests by Outcome*|timeseries (bars)|Heartbeat-запросы с разбивкой по результату (result/reason)|{{kms_heartbeat_requests_total}}|
+|*Unseal Requests by Outcome*|timeseries (bars)|Unseal-запросы с разбивкой по результату (result/reason)|{{kms_unseal_requests_total}}|
+|*Heartbeat Timeouts*|timeseries|Частота срабатывания Dead Man's Switch (блокировки по таймауту)|{{kms_heartbeat_timeouts_total}}|
+|*Lease Store Errors by Operation*|timeseries (bars)|Ошибки хранилища lease с разбивкой по операции|{{kms_lease_store_errors_total}}|
+|*KMS Request Duration p95*|timeseries|Латентность p95 для heartbeat и unseal запросов|{{kms_request_duration_seconds_bucket}}|
+
+h3. На что обращать внимание
+
+* *Expired Leases > 0* — есть ноды, чей lease истёк. Может означать проблемы с heartbeat или сетью.
+* *Timeout Blocks Total растёт* — Dead Man's Switch блокирует ноды. Проверить доступность kms-agent и сетевую связность.
+* *Lease Store Errors > 0* — проблемы с файловым хранилищем lease. Проверить диск и права доступа.
+* *Unseal Requests с reason != ok* — ноды не могут получить ключи. Возможна блокировка или ошибка конфигурации.
+
+h2. Конфигурация kms-server
+
+h3. Переменные окружения
+
+||Переменная||Описание||Обязательно||
+|{{HEARTBEAT_HMAC_KEY}}|Pre-shared ключ HMAC-SHA256|Да (при heartbeat)|
+|{{ADMIN_TOKEN}}|Токен для admin API|Да (при heartbeat)|
+
+Секреты зашифрованы через ansible-vault и хранятся в [devops/iac/ansible/roles/talos-kms|https://gl.pypypy.py/devops/iac/-/tree/main/ansible/roles/talos-kms] ({{vars/vault.yml}}).
+SSH-ключ деплоя и пароль ansible-vault продублированы в Hashicorp Vault.
+
+h3. Бэкап master.key
+
+Master key ({{/etc/kms-server/master.key}}) — критический секрет. Без него LUKS-диски нерасшифровуемы.
+
+Бэкапы:
+* *Ansible-vault* — {{talos_kms_master_key_backup}} в {{devops/iac/ansible/roles/talos-kms/vars/vault.yml}}
+* *Hashicorp Vault* — {{secret/kms/master-key}}
+
+При восстановлении — декодировать из base64 и записать в {{/etc/kms-server/master.key}} (владелец {{kms-server:kms-server}}, права {{0600}}).
+
+h3. Флаги командной строки
+
+||Флаг||Описание||По умолчанию||
+|{{--kms-api-endpoint}}|Адрес gRPC API|{{:4050}}|
+|{{--key-path}}|Путь к master key|— (обязательно)|
+|{{--tls-enable}}|Включить TLS на gRPC|{{false}}|
+|{{--tls-cert-path}}|Путь к TLS-сертификату|—|
+|{{--tls-key-path}}|Путь к TLS-ключу|—|
+|{{--heartbeat-enable}}|Включить Dead Man's Switch|{{false}}|
+|{{--heartbeat-interval}}|Ожидаемый интервал heartbeat|{{30s}}|
+|{{--heartbeat-timeout}}|Время без heartbeat до блокировки|{{120s}}|
+|{{--heartbeat-check-interval}}|Интервал проверки таймаутов|{{30s}}|
+|{{--lease-duration}}|Длительность lease|— (обязательно при heartbeat)|
+|{{--lease-store-path}}|Путь к файлу хранилища lease|— (обязательно при heartbeat)|
+|{{--http-endpoint}}|Адрес HTTP API (heartbeat + admin)|{{:4051}}|
+|{{--metrics-endpoint}}|Адрес Prometheus метрик|{{:2112}}|
+
+h2. Конфигурация kms-agent
+
+||Переменная||Описание||По умолчанию||
+|{{NODE_UUID}}|UUID узла (автоопределение через {{/node/identify}})|автоопределение|
+|{{NODE_IP}}|IP узла ({{status.podIP}} в K8s)|— (обязательно)|
+|{{NODE_HOSTNAME}}|Имя узла (отображается в admin API). Fallback на {{os.Hostname()}}|автоопределение|
+|{{KMS_SERVER_URL}}|URL HTTP API KMS-сервера|— (обязательно)|
+|{{HEARTBEAT_HMAC_KEY}}|Pre-shared HMAC ключ|— (обязательно)|
+|{{HEARTBEAT_INTERVAL}}|Интервал отправки heartbeat|{{30s}}|
+|{{HEARTBEAT_TIMEOUT}}|Таймаут HTTP-запроса|{{5s}}|
+
+h2. HTTP API
+
+h3. POST /node/identify
+
+Получение {{node_uuid}} по IP-адресу. Используется агентом при старте.
+
+{code:language=bash}
+curl -X POST http://kms-server:4051/node/identify \
+  -H "Content-Type: application/json" \
+  -H "X-HMAC-Signature: <hmac_hex>" \
+  -d '{"node_ip": "10.0.0.1", "timestamp": 1700000000}'
+{code}
+
+Ответ {{200}}:
+{code:language=json}
+{"node_uuid": "abc-123", "status": "active"}
+{code}
+
+Ответ {{404}} — нода ещё не прошла первый Unseal:
+{code:language=json}
+{"error": "node_not_found"}
+{code}
+
+h3. POST /heartbeat
+
+Отправка heartbeat от агента.
+
+{code:language=bash}
+curl -X POST http://kms-server:4051/heartbeat \
+  -H "Content-Type: application/json" \
+  -H "X-HMAC-Signature: <hmac_hex>" \
+  -d '{"node_uuid": "node-1", "node_ip": "10.0.0.1", "hostname": "worker-1", "timestamp": 1700000000}'
+{code}
+
+Ответ {{200}}:
+{code:language=json}
+{"status": "ok", "next_heartbeat_in": 30}
+{code}
+
+Ответ {{403}} — узел заблокирован:
+{code:language=json}
+{"error": "node_blocked", "reason": "heartbeat_timeout"}
+{code}
+
+h3. GET /admin/nodes
+
+Список всех узлов. Требует {{Authorization: Bearer <ADMIN_TOKEN>}}.
+
+{code:language=bash}
+curl -H "Authorization: Bearer <token>" http://kms-server:4051/admin/nodes
+{code}
+
+h3. POST /admin/nodes/\{uuid\}/unblock
+
+Разблокировка узла. Требует {{Authorization: Bearer <ADMIN_TOKEN>}}.
+
+{code:language=bash}
+curl -X POST -H "Authorization: Bearer <token>" \
+  http://kms-server:4051/admin/nodes/node-1/unblock
+{code}
+
+h3. POST /admin/nodes/\{uuid\}/maintenance
+
+Включение/выключение режима обслуживания. Узел в maintenance mode не блокируется Dead Man's Switch при отсутствии heartbeat. Требует {{Authorization: Bearer <ADMIN_TOKEN>}}.
+
+Включить:
+{code:language=bash}
+curl -X POST -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}' \
+  http://kms-server:4051/admin/nodes/node-1/maintenance
+{code}
+
+Выключить (узел получает grace period для возобновления heartbeat):
+{code:language=bash}
+curl -X POST -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}' \
+  http://kms-server:4051/admin/nodes/node-1/maintenance
+{code}
+
+h2. CI/CD
+
+h3. Пайплайн devops-utils (kms-client)
+
+Запускается при пуше с изменениями в {{kms-client/}}. Ручной запуск через GitLab UI — только с переменной {{job}}.
+
+Режимы:
+
+* {{push}} с изменениями в {{kms-client/**}} — автоматический pipeline ({{lint/test/build/...}})
+* {{web}} pipeline с переменной {{job}} — только адресная KMS admin job
+* {{web}} pipeline без переменной {{job}} — ни одна джоба не запустится
+
+||Стадия||Job||Описание||
+|verify|{{lint}}|golangci-lint|
+|verify|{{test}}|go test + coverage|
+|build|{{build:kms-server}}|Бинарник kms-server (linux/amd64)|
+|build|{{build:kms-agent-image}}|Docker-образ kms-agent → Container Registry (Kaniko)|
+|publish|{{publish:kms-server}}|Бинарник → Generic Package Registry (только main)|
+|deploy|{{deploy:kms-server}}|Trigger пайплайна devops/iac (только main)|
+|sync|{{kms_list_nodes}}|Ручной вывод всех KMS lease через admin API|
+|sync|{{kms_list_blocked_nodes}}|Ручной вывод только заблокированных узлов|
+|sync|{{kms_unblock_node}}|Разблокировка узла по UUID или hostname|
+|sync|{{kms_maintenance_on}}|Включение maintenance mode для узла|
+|sync|{{kms_maintenance_off}}|Выключение maintenance mode для узла|
+
+h3. Пайплайн devops/iac
+
+Запускается по trigger из devops-utils:
+# Получает переменную {{KMS_VERSION}} из trigger
+# Скачивает бинарник {{kms-server}} из Generic Package Registry devops-utils
+# Запускает {{ansible-playbook talos-kms.yml}} — копирует бинарник на сервер и перезапускает сервис
+
+Образ: {{cytopia/ansible:latest-tools}}. Раннер: {{talos-k8s}} (Kubernetes).
+SSH-подключение к {{kms.mgmt.pypypy.py}} под пользователем {{ansible}} (sudo, NOPASSWD).
+
+h3. Версионирование
+
+Версия формируется автоматически: {{KMS_VERSION_PREFIX}}.{{CI_PIPELINE_IID}}.
+
+* {{KMS_VERSION_PREFIX}} — переменная в {{.gitlab-ci.yml}} (по умолчанию {{1.0}})
+* {{CI_PIPELINE_IID}} — авто-инкремент GitLab (уникальный номер пайплайна в проекте)
+* Пример: {{1.0.42}}, {{1.0.43}}, ...
+* Для смены major/minor — обновить {{KMS_VERSION_PREFIX}} в {{.gitlab-ci.yml}}.
+
+h3. CI-переменные
+
+{info}*devops-utils:*{info}
+
+||Переменная||Описание||
+|{{IAC_TRIGGER_TOKEN}}|Trigger token для запуска пайплайна devops/iac|
+|{{IAC_PROJECT_ID}}|ID проекта devops/iac (захардкожен: {{6}})|
+|{{KMS_ADMIN_TOKEN}}|Токен admin API для ручных KMS jobs; хранится в CI/CD variables проекта|
+|{{KMS_BASE_URL}}|Базовый URL admin API, по умолчанию {{https://kms.mgmt.pypypy.py}}|
+|{{KMS_NODE}}|UUID или hostname узла для jobs {{kms_unblock_node}}, {{kms_maintenance_on}}, {{kms_maintenance_off}}|
+
+{info}*devops/iac:*{info}
+
+||Переменная||Описание||
+|{{DEVOPS_UTILS_PROJECT_ID}}|ID проекта devops-utils (захардкожен: {{3}})|
+|{{ANSIBLE_SSH_KEY}}|SSH-ключ (base64) для пользователя {{ansible}} на KMS-сервере|
+|{{ANSIBLE_VAULT_PASSWORD}}|Пароль ansible-vault|
+
+h3. Кросс-проектный доступ
+
+Для скачивания бинарника из Package Registry в iac pipeline используется {{CI_JOB_TOKEN}}.
+В проекте *devops-utils* необходимо разрешить доступ:
+Settings → CI/CD → Job token permissions → добавить {{devops/iac}}.
+
+h2. Сборка
+
+{code:language=bash}
+# Бинарники
+CGO_ENABLED=0 go build -ldflags="-s -w" -o _out/kms-server-linux-amd64 ./cmd/kms-server
+CGO_ENABLED=0 go build -ldflags="-s -w" -o _out/kms-agent-linux-amd64 ./cmd/kms-agent
+
+# Docker-образ kms-agent
+docker build -f Dockerfile.kms-agent -t kms-agent:latest .
+
+# Тесты
+go test ./...
+
+# Линтер
+golangci-lint run --config .golangci.yml
+{code}
+
+h2. Деплой
+
+h3. kms-server
+
+Автоматический деплой при пуше в main:
+# CI собирает бинарник и публикует в Package Registry
+# Trigger запускает пайплайн в devops/iac
+# Ansible скачивает бинарник из Registry и деплоит на {{kms.mgmt.pypypy.py}}
+
+Ручной деплой через Ansible:
+{code:language=bash}
+cd devops/iac/ansible
+ansible-playbook talos-kms.yml
+{code}
+
+h3. kms-agent
+
+Docker-образ автоматически публикуется в Container Registry при пуше. Деплой в Kubernetes — Helm-чарт в репозитории {{devops/helm-infra/kms-agent/}}.
+
+h3. KMS admin jobs
+
+Для управления KMS admin API через GitLab UI поддерживаются ручные jobs по тому же
+паттерну, что и в Keycloak: через *Run pipeline* и переменную {{job}}.
+
+Если задана переменная {{job}}, запускается только выбранная KMS admin job без
+{{lint/test/build/publish/deploy}}.
+
+Поддерживаются:
+
+* {{job=kms_list_nodes}}
+* {{job=kms_list_blocked_nodes}}
+* {{job=kms_unblock_node}}
+* {{job=kms_maintenance_on}}
+* {{job=kms_maintenance_off}}
+
+Для всех KMS admin jobs требуется {{KMS_ADMIN_TOKEN}}.
+Если {{KMS_ADMIN_TOKEN}} уже сохранен в CI/CD variables проекта, указывать его вручную
+при запуске pipeline не нужно.
+
+Для {{kms_unblock_node}}, {{kms_maintenance_on}}, {{kms_maintenance_off}} дополнительно требуется:
+
+* {{KMS_NODE=<uuid или hostname>}}
+
+Примеры запуска:
+
+{code:title=List all nodes}
+job=kms_list_nodes
+{code}
+
+{code:title=List blocked nodes}
+job=kms_list_blocked_nodes
+{code}
+
+{code:title=Unblock node by hostname}
+job=kms_unblock_node
+KMS_NODE=worker-1
+{code}
+
+{code:title=Enable maintenance mode}
+job=kms_maintenance_on
+KMS_NODE=worker-1
+{code}
+
+{code:title=Disable maintenance mode}
+job=kms_maintenance_off
+KMS_NODE=worker-1
+{code}

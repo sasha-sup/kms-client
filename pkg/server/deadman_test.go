@@ -34,7 +34,7 @@ func TestDeadManSwitchBlocksNodeAfterTimeout(t *testing.T) {
 	now = now.Add(60 * time.Second)
 
 	// Send heartbeat for node-2 to keep it alive.
-	_, err = store.HeartbeatByUUID("node-2", "10.0.0.2", now, 5*time.Minute)
+	_, err = store.HeartbeatByUUID("node-2", "10.0.0.2", "", now, 5*time.Minute)
 	require.NoError(t, err)
 
 	// Advance time to exceed timeout (120s total from bootstrap).

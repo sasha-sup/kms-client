@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -351,6 +352,31 @@ func TestFileLeaseStorePersistsHeartbeatState(t *testing.T) {
 	require.Equal(t, server.LeaseStatusActive, state.Status)
 }
 
+func TestBootstrapPreservesHostname(t *testing.T) {
+	t.Parallel()
+
+	storePath := filepath.Join(t.TempDir(), "leases.json")
+	store, err := server.NewFileLeaseStore(storePath, nil)
+	require.NoError(t, err)
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+
+	// First heartbeat sets the hostname.
+	_, err = store.HeartbeatByUUID(testNodeUUID, "10.0.0.10", "worker-1", now, 5*time.Second)
+	require.NoError(t, err)
+
+	// Re-unseal (Bootstrap) must preserve the hostname.
+	rec, err := store.Bootstrap(testNodeUUID, "10.0.0.10", now.Add(time.Second), 5*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "worker-1", rec.Hostname)
+
+	// Verify persisted state also has the hostname.
+	state, ok, err := store.Get(testNodeUUID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "worker-1", state.Hostname)
+}
+
 func newLeaseServer(t *testing.T, storePath string, now func() time.Time) (*server.Server, *server.LeaseStore) {
 	t.Helper()
 
@@ -393,4 +419,35 @@ func contextWithPeerIP(ctx context.Context, ip string) context.Context {
 			Port: 4050,
 		},
 	})
+}
+
+func TestPeerIPFromContext_XRealIP(t *testing.T) {
+	// X-Real-IP in metadata should take priority over peer address.
+	ctx := contextWithPeerIP(context.Background(), "127.0.0.1")
+	md := metadata.Pairs("x-real-ip", "10.0.0.5")
+	ctx = metadata.NewIncomingContext(ctx, md)
+
+	ip, err := server.PeerIPFromContext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.5", ip)
+}
+
+func TestPeerIPFromContext_FallbackToPeer(t *testing.T) {
+	// Without X-Real-IP, should fall back to peer address.
+	ctx := contextWithPeerIP(context.Background(), "192.168.1.10")
+
+	ip, err := server.PeerIPFromContext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "192.168.1.10", ip)
+}
+
+func TestPeerIPFromContext_InvalidXRealIP(t *testing.T) {
+	// Invalid X-Real-IP should be ignored, fall back to peer.
+	ctx := contextWithPeerIP(context.Background(), "192.168.1.10")
+	md := metadata.Pairs("x-real-ip", "not-an-ip")
+	ctx = metadata.NewIncomingContext(ctx, md)
+
+	ip, err := server.PeerIPFromContext(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "192.168.1.10", ip)
 }

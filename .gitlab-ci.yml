@@ -1,35 +1,161 @@
-stages:
-  - verify
-  - build
-  - publish
-
 variables:
-  DOCKER_BUILDKIT: "1"
-  DOCKER_DRIVER: overlay2
-  DOCKER_TLS_CERTDIR: "/certs"
-  GIT_DEPTH: "1"
+  CGO_ENABLED: "0"
+  IAC_PROJECT_ID: 6
+  KMS_VERSION_PREFIX: "1.0"
+
+.kms-rules:
+  rules:
+    - if: '$job'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - kms-client/**
+
+.kms-main-rules:
+  rules:
+    - if: '$job'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - kms-client/**
 
 default:
-  image: docker:28.1.1-git
-  services:
-    - name: docker:28.1.1-dind
+  image: golang:1.24-alpine
   before_script:
-    - docker version
-    - docker buildx create --name gitlab-builder --use || docker buildx use gitlab-builder
+    - cd kms-client
+    - export VERSION="${KMS_VERSION_PREFIX}.${CI_PIPELINE_IID}"
 
-verify:
+.kms-admin-template:
+  stage: sync
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache bash curl jq util-linux
+    - cd kms-client
+    - chmod +x scripts/kms-admin.sh
+
+kms_list_nodes:
+  extends: .kms-admin-template
+  script:
+    - ./scripts/kms-admin.sh list
+  rules:
+    - if: '$job == "kms_list_nodes"'
+    - when: never
+
+kms_list_blocked_nodes:
+  extends: .kms-admin-template
+  script:
+    - ./scripts/kms-admin.sh blocked
+  rules:
+    - if: '$job == "kms_list_blocked_nodes"'
+    - when: never
+
+kms_unblock_node:
+  extends: .kms-admin-template
+  script:
+    - test -n "$KMS_NODE" || (echo "KMS_NODE is not set"; exit 1)
+    - ./scripts/kms-admin.sh unblock "$KMS_NODE"
+  rules:
+    - if: '$job == "kms_unblock_node"'
+    - when: never
+
+kms_maintenance_on:
+  extends: .kms-admin-template
+  script:
+    - test -n "$KMS_NODE" || (echo "KMS_NODE is not set"; exit 1)
+    - ./scripts/kms-admin.sh maintenance "$KMS_NODE" on
+  rules:
+    - if: '$job == "kms_maintenance_on"'
+    - when: never
+
+kms_maintenance_off:
+  extends: .kms-admin-template
+  script:
+    - test -n "$KMS_NODE" || (echo "KMS_NODE is not set"; exit 1)
+    - ./scripts/kms-admin.sh maintenance "$KMS_NODE" off
+  rules:
+    - if: '$job == "kms_maintenance_off"'
+    - when: never
+
+lint:
+  extends: .kms-rules
+  stage: verify
+  image: golangci/golangci-lint:v2.8.0-alpine
+  script:
+    - golangci-lint run --config .golangci.yml
+
+test:
+  extends: .kms-rules
   stage: verify
   script:
-    - make lint-golangci-lint
-    - make unit-tests
+    - go test -coverprofile=coverage.txt ./...
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: kms-client/coverage.txt
+    expire_in: 7 days
 
 build:kms-server:
+  extends: .kms-rules
   stage: build
   script:
-    - make local-kms-server-linux-amd64 DEST=_out
+    - >-
+      go build -ldflags="-s -w"
+      -o _out/kms-server-linux-amd64
+      ./cmd/kms-server
   artifacts:
-    name: "kms-server-${CI_COMMIT_SHA}"
-    expire_in: 1 week
+    name: "kms-server-${CI_COMMIT_SHORT_SHA}"
+    expire_in: 4 weeks
     paths:
-      - _out/kms-server-linux-amd64
+      - kms-client/_out/
 
+build:kms-agent-image:
+  extends: .kms-rules
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - |
+      cat > /kaniko/.docker/config.json <<EOF
+      {"auths":{"${CI_REGISTRY}":{"username":"gitlab-ci-token","password":"${CI_JOB_TOKEN}"}}}
+      EOF
+    - export VERSION="${KMS_VERSION_PREFIX}.${CI_PIPELINE_IID}"
+  script:
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}/kms-client"
+      --dockerfile "${CI_PROJECT_DIR}/kms-client/Dockerfile.kms-agent"
+      --destination "${CI_REGISTRY_IMAGE}/kms-agent:${VERSION}"
+      --destination "${CI_REGISTRY_IMAGE}/kms-agent:latest"
+
+publish:kms-server:
+  extends: .kms-main-rules
+  stage: publish
+  image: curlimages/curl:latest
+  before_script:
+    - export VERSION="${KMS_VERSION_PREFIX}.${CI_PIPELINE_IID}"
+  script:
+    - |
+      echo "Uploading kms-server-linux-amd64 v${VERSION}"
+      curl --fail --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file "kms-client/_out/kms-server-linux-amd64" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/kms-client/${VERSION}/kms-server-linux-amd64"
+
+deploy:kms-server:
+  extends: .kms-main-rules
+  stage: deploy
+  image: curlimages/curl:latest
+  needs:
+    - publish:kms-server
+  before_script:
+    - export VERSION="${KMS_VERSION_PREFIX}.${CI_PIPELINE_IID}"
+  script:
+    - |
+      curl --fail --request POST \
+        --form "token=${IAC_TRIGGER_TOKEN}" \
+        --form "ref=main" \
+        --form "variables[PLAYBOOK]=talos-kms.yml" \
+        --form "variables[KMS_VERSION]=${VERSION}" \
+        "${CI_API_V4_URL}/projects/${IAC_PROJECT_ID}/trigger/pipeline"

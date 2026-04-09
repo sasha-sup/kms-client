@@ -29,19 +29,19 @@ import (
 )
 
 var kmsFlags struct {
-	apiEndpoint            string
-	httpEndpoint           string
+	tlsKeyPath             string
+	heartbeatHMACKey       string
 	keyPath                string
 	leaseStorePath         string
 	metricsEndpoint        string
 	tlsCertPath            string
-	tlsKeyPath             string
-	heartbeatHMACKey       string
+	httpEndpoint           string
 	adminToken             string
-	heartbeatInterval      time.Duration
-	heartbeatTimeout       time.Duration
-	heartbeatCheckInterval time.Duration
+	apiEndpoint            string
 	leaseDuration          time.Duration
+	heartbeatInterval      time.Duration
+	heartbeatCheckInterval time.Duration
+	heartbeatTimeout       time.Duration
 	heartbeatEnable        bool
 	tlsEnable              bool
 }

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/siderolabs/kms-client/pkg/server"
 )
@@ -26,6 +27,7 @@ import (
 type agentConfig struct {
 	nodeUUID          string
 	nodeIP            string
+	hostname          string
 	kmsServerURL      string
 	hmacKey           string
 	heartbeatInterval time.Duration
@@ -35,17 +37,18 @@ type agentConfig struct {
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 
-	if err := run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
-		cancel()
-		os.Exit(1)
-	}
+	err := run(ctx)
 
 	cancel()
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		os.Exit(1) //nolint:gocritic
+	}
 }
 
 func run(ctx context.Context) error {
-	logger, err := zap.NewProduction()
+	logger, err := newLogger()
 	if err != nil {
 		return fmt.Errorf("failed to create logger: %w", err)
 	}
@@ -60,6 +63,7 @@ func run(ctx context.Context) error {
 	logger.Info("starting KMS heartbeat agent",
 		zap.String("node_uuid", cfg.nodeUUID),
 		zap.String("node_ip", cfg.nodeIP),
+		zap.String("hostname", cfg.hostname),
 		zap.String("kms_server_url", cfg.kmsServerURL),
 		zap.Duration("heartbeat_interval", cfg.heartbeatInterval),
 	)
@@ -88,10 +92,29 @@ func run(ctx context.Context) error {
 	return heartbeatLoop(ctx, logger, client, hmacAuth, cfg)
 }
 
+func newLogger() (*zap.Logger, error) {
+	cfg := zap.NewProductionConfig()
+	cfg.DisableCaller = true
+	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+
+	return cfg.Build()
+}
+
 func loadConfig() (agentConfig, error) {
+	hostname := os.Getenv("NODE_HOSTNAME")
+	if hostname == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			return agentConfig{}, fmt.Errorf("failed to get hostname: %w", err)
+		}
+
+		hostname = h
+	}
+
 	cfg := agentConfig{
 		nodeUUID:          os.Getenv("NODE_UUID"),
 		nodeIP:            os.Getenv("NODE_IP"),
+		hostname:          hostname,
 		kmsServerURL:      os.Getenv("KMS_SERVER_URL"),
 		hmacKey:           os.Getenv("HEARTBEAT_HMAC_KEY"),
 		heartbeatInterval: 30 * time.Second,
@@ -193,15 +216,17 @@ func heartbeatLoop(ctx context.Context, logger *zap.Logger, client *http.Client,
 type heartbeatRequest struct {
 	NodeUUID  string `json:"node_uuid"`
 	NodeIP    string `json:"node_ip"`
+	Hostname  string `json:"hostname,omitempty"`
 	Timestamp int64  `json:"timestamp"`
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (err error) {
+func sendHeartbeat(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) error {
 	timestamp := time.Now().Unix()
 
 	reqBody := heartbeatRequest{
 		NodeUUID:  cfg.nodeUUID,
 		NodeIP:    cfg.nodeIP,
+		Hostname:  cfg.hostname,
 		Timestamp: timestamp,
 	}
 
@@ -223,12 +248,7 @@ func sendHeartbeat(ctx context.Context, client *http.Client, hmacAuth *server.HM
 		return fmt.Errorf("heartbeat request failed: %w", err)
 	}
 
-	defer func() {
-		closeErr := resp.Body.Close()
-		if err == nil && closeErr != nil {
-			err = fmt.Errorf("failed to close heartbeat response body: %w", closeErr)
-		}
-	}()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusOK {
 		return nil
@@ -268,7 +288,7 @@ func identifyLoop(ctx context.Context, logger *zap.Logger, client *http.Client, 
 	}
 }
 
-func sendIdentify(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (nodeUUID string, err error) {
+func sendIdentify(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (string, error) {
 	timestamp := time.Now().Unix()
 
 	reqBody := struct {
@@ -297,12 +317,7 @@ func sendIdentify(ctx context.Context, client *http.Client, hmacAuth *server.HMA
 		return "", fmt.Errorf("identify request failed: %w", err)
 	}
 
-	defer func() {
-		closeErr := resp.Body.Close()
-		if err == nil && closeErr != nil {
-			err = fmt.Errorf("failed to close identify response body: %w", closeErr)
-		}
-	}()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotFound {
 		return "", fmt.Errorf("node not yet registered (waiting for first Unseal)")

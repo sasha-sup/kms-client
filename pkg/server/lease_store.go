@@ -40,12 +40,15 @@ type LeaseRecord struct {
 	LastHeartbeatAt time.Time   `json:"last_heartbeat_at"`
 	LeaseUntil      time.Time   `json:"lease_until"`
 	LastUnsealAt    time.Time   `json:"last_unseal_at"`
+	FirstSeen       time.Time   `json:"first_seen,omitzero"`
+	BlockedAt       time.Time   `json:"blocked_at,omitzero"`
+	MaintenanceAt   time.Time   `json:"maintenance_at,omitzero"`
 	LastUnsealIP    string      `json:"last_unseal_ip"`
 	Status          LeaseStatus `json:"status"`
-	FirstSeen       time.Time   `json:"first_seen"`
 	NodeIP          string      `json:"node_ip,omitempty"`
-	BlockedAt       time.Time   `json:"blocked_at"`
+	Hostname        string      `json:"hostname,omitempty"`
 	BlockReason     string      `json:"block_reason,omitempty"`
+	Maintenance     bool        `json:"maintenance,omitempty"`
 }
 
 type leaseStoreFile struct {
@@ -93,6 +96,7 @@ func (store *LeaseStore) Bootstrap(nodeUUID, peerIP string, now time.Time, lease
 
 	if existing, ok := store.nodes[nodeUUID]; ok {
 		record.FirstSeen = existing.FirstSeen
+		record.Hostname = existing.Hostname
 	} else {
 		record.FirstSeen = now.UTC()
 	}
@@ -191,7 +195,7 @@ func (store *LeaseStore) Get(nodeUUID string) (LeaseRecord, bool, error) {
 }
 
 // HeartbeatByUUID refreshes the lease for a node identified by UUID directly (used by HTTP heartbeat).
-func (store *LeaseStore) HeartbeatByUUID(nodeUUID, nodeIP string, now time.Time, leaseDuration time.Duration) (LeaseRecord, error) {
+func (store *LeaseStore) HeartbeatByUUID(nodeUUID, nodeIP, hostname string, now time.Time, leaseDuration time.Duration) (LeaseRecord, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
@@ -202,6 +206,7 @@ func (store *LeaseStore) HeartbeatByUUID(nodeUUID, nodeIP string, now time.Time,
 		record = LeaseRecord{
 			FirstSeen:       now,
 			NodeIP:          nodeIP,
+			Hostname:        hostname,
 			LastHeartbeatAt: now,
 			LeaseUntil:      now.Add(leaseDuration),
 			Status:          LeaseStatusActive,
@@ -219,6 +224,11 @@ func (store *LeaseStore) HeartbeatByUUID(nodeUUID, nodeIP string, now time.Time,
 	record.LastHeartbeatAt = now
 	record.LeaseUntil = now.Add(leaseDuration)
 	record.NodeIP = nodeIP
+
+	if hostname != "" {
+		record.Hostname = hostname
+	}
+
 	record.Status = LeaseStatusActive
 	store.nodes[nodeUUID] = record
 	store.updateLeaseMetricsLocked(now)
@@ -259,6 +269,33 @@ func (store *LeaseStore) Unblock(nodeUUID string, now time.Time, leaseDuration t
 	return record, store.persistLocked()
 }
 
+// SetMaintenance toggles maintenance mode for a node. Nodes in maintenance mode
+// are exempt from the dead-man's switch heartbeat timeout.
+func (store *LeaseStore) SetMaintenance(nodeUUID string, enabled bool, now time.Time, leaseDuration time.Duration) (LeaseRecord, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	record, ok := store.nodes[nodeUUID]
+	if !ok {
+		return LeaseRecord{}, ErrLeaseNotFound
+	}
+
+	now = now.UTC()
+	record.Maintenance = enabled
+
+	if enabled {
+		record.MaintenanceAt = now
+	} else {
+		record.MaintenanceAt = time.Time{}
+		record.LastHeartbeatAt = now
+		record.LeaseUntil = now.Add(leaseDuration)
+	}
+
+	store.nodes[nodeUUID] = record
+
+	return record, store.persistLocked()
+}
+
 // BlockExpiredNodes checks all active nodes and blocks those whose heartbeat
 // has exceeded the timeout. Returns the list of newly blocked node UUIDs.
 func (store *LeaseStore) BlockExpiredNodes(now time.Time, heartbeatTimeout time.Duration) []string {
@@ -271,6 +308,10 @@ func (store *LeaseStore) BlockExpiredNodes(now time.Time, heartbeatTimeout time.
 
 	for nodeUUID, record := range store.nodes {
 		if record.Status != LeaseStatusActive {
+			continue
+		}
+
+		if record.Maintenance {
 			continue
 		}
 
@@ -291,10 +332,7 @@ func (store *LeaseStore) BlockExpiredNodes(now time.Time, heartbeatTimeout time.
 
 	if len(blocked) > 0 {
 		store.updateLeaseMetricsLocked(now)
-
-		if err := store.persistLocked(); err != nil {
-			store.metrics.incLeaseStoreError("block_expired_nodes")
-		}
+		_ = store.persistLocked() //nolint:errcheck
 	}
 
 	return blocked
