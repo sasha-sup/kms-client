@@ -62,6 +62,41 @@ func roundTimestamp(ts int64) int64 {
 	return ts / 30 * 30
 }
 
+// SignIdentify produces an HMAC-SHA256 hex signature over node_ip + timestamp
+// (without node_uuid, which is unknown to the agent at identify time).
+func (a *HMACAuth) SignIdentify(nodeIP string, timestamp int64) string {
+	rounded := roundTimestamp(timestamp)
+	msg := fmt.Sprintf("%s%d", nodeIP, rounded)
+
+	mac := hmac.New(sha256.New, a.key)
+	mac.Write([]byte(msg))
+
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyIdentify checks the HMAC signature for identify requests (ip + timestamp only).
+func (a *HMACAuth) VerifyIdentify(nodeIP string, timestamp int64, signature string) bool {
+	sigBytes, err := hex.DecodeString(signature)
+	if err != nil {
+		return false
+	}
+
+	rounded := roundTimestamp(timestamp)
+
+	for _, ts := range []int64{rounded, rounded - 30, rounded + 30} {
+		msg := fmt.Sprintf("%s%d", nodeIP, ts)
+
+		mac := hmac.New(sha256.New, a.key)
+		mac.Write([]byte(msg))
+
+		if hmac.Equal(mac.Sum(nil), sigBytes) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // ValidateTimestamp checks that the provided timestamp is within an acceptable
 // range of the current time (±60 seconds).
 func ValidateTimestamp(timestamp int64, now time.Time) bool {

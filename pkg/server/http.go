@@ -59,8 +59,19 @@ func NewHTTPHandler(opts HTTPHandlerOptions) *HTTPHandler {
 // RegisterRoutes registers HTTP routes on the provided mux.
 func (h *HTTPHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /heartbeat", h.handleHeartbeat)
+	mux.HandleFunc("POST /node/identify", h.handleIdentify)
 	mux.HandleFunc("GET /admin/nodes", h.handleListNodes)
 	mux.HandleFunc("POST /admin/nodes/{uuid}/unblock", h.handleUnblockNode)
+}
+
+type identifyRequest struct {
+	NodeIP    string `json:"node_ip"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+type identifyResponse struct {
+	NodeUUID string `json:"node_uuid"`
+	Status   string `json:"status"`
 }
 
 type heartbeatRequest struct {
@@ -87,6 +98,51 @@ type nodeResponse struct {
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
 	BlockedAt     *time.Time `json:"blocked_at,omitempty"`
 	BlockReason   string     `json:"block_reason,omitempty"`
+}
+
+func (h *HTTPHandler) handleIdentify(w http.ResponseWriter, r *http.Request) {
+	var req identifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid_request"})
+		return
+	}
+
+	if req.NodeIP == "" || req.Timestamp == 0 {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing_fields"})
+		return
+	}
+
+	if !ValidateTimestamp(req.Timestamp, h.now()) {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "timestamp_out_of_range"})
+		return
+	}
+
+	signature := r.Header.Get("X-HMAC-Signature")
+	if signature == "" || !h.hmacAuth.VerifyIdentify(req.NodeIP, req.Timestamp, signature) {
+		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid_signature"})
+		return
+	}
+
+	nodeUUID, record, err := h.leaseStore.LookupByIP(req.NodeIP)
+	if err != nil {
+		h.logger.Debug("identify failed: node not found for IP",
+			zap.String("node_ip", req.NodeIP),
+		)
+
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "node_not_found"})
+
+		return
+	}
+
+	h.logger.Debug("node identified by IP",
+		zap.String("node_ip", req.NodeIP),
+		zap.String("node_uuid", nodeUUID),
+	)
+
+	writeJSON(w, http.StatusOK, identifyResponse{
+		NodeUUID: nodeUUID,
+		Status:   string(record.Status),
+	})
 }
 
 func (h *HTTPHandler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {

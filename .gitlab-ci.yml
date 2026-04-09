@@ -33,14 +33,3 @@ build:kms-server:
     paths:
       - _out/kms-server-linux-amd64
 
-publish:kms-client-image:
-  stage: publish
-  needs:
-    - verify
-  script:
-    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
-    - REGISTRY="$CI_REGISTRY" USERNAME="$CI_PROJECT_PATH" IMAGE_TAG="$CI_COMMIT_SHA" PUSH=true make registry-image-kms-client IMAGE_NAME="kms-client"
-    - |
-      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
-        REGISTRY="$CI_REGISTRY" USERNAME="$CI_PROJECT_PATH" IMAGE_TAG="latest" PUSH=true make registry-image-kms-client IMAGE_NAME="kms-client"
-      fi

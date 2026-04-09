@@ -322,11 +322,11 @@ func (srv *Server) validateLease(nodeUUID string) error {
 	}
 
 	if errors.Is(err, ErrLeaseNotFound) {
-		srv.logger.Warn("denied unseal because heartbeat lease is missing",
+		srv.logger.Info("allowing first unseal for unregistered node",
 			zap.String("node_uuid", nodeUUID),
 		)
 
-		return status.Error(codes.PermissionDenied, "heartbeat lease is missing")
+		return nil
 	}
 
 	if errors.Is(err, ErrLeaseExpired) {

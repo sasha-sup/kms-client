@@ -21,20 +21,21 @@ spec:
         - name: kms-agent
           image: ghcr.io/siderolabs/kms-agent:latest
           env:
-            # spec.nodeName is used as NODE_UUID.
-            # On Talos Linux the node name matches the machine UUID
-            # exposed via /sys/class/dmi/id/product_uuid when the node
-            # is registered with its machine UUID. If a different UUID
-            # source is required, replace the fieldRef below with the
-            # appropriate value (e.g., from a machine config annotation).
-            - name: NODE_UUID
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
+            # NODE_UUID is optional. When omitted the agent discovers
+            # its UUID from the KMS server via POST /node/identify
+            # using its IP address. The server learns the UUID during
+            # the first Unseal request from Talos at boot time.
+            # If you know the UUID (e.g., from Talos machine config),
+            # you can still set it explicitly here.
+            #
+            # - name: NODE_UUID
+            #   valueFrom:
+            #     fieldRef:
+            #       fieldPath: spec.nodeName
             - name: NODE_IP
               valueFrom:
                 fieldRef:
-                  fieldPath: status.podIP
+                  fieldPath: status.hostIP
             - name: KMS_SERVER_URL
               valueFrom:
                 configMapKeyRef:

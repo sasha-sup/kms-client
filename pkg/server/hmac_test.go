@@ -65,6 +65,30 @@ func TestHMACRejectsTamperedData(t *testing.T) {
 	require.False(t, auth.Verify("node-1", "10.0.0.2", ts, sig))
 }
 
+func TestHMACIdentifySignAndVerify(t *testing.T) {
+	t.Parallel()
+
+	auth := server.NewHMACAuth("test-key")
+
+	ts := time.Unix(1_700_000_000, 0).Unix()
+	sig := auth.SignIdentify("10.0.0.1", ts)
+
+	require.True(t, auth.VerifyIdentify("10.0.0.1", ts, sig))
+	require.False(t, auth.VerifyIdentify("10.0.0.2", ts, sig))
+}
+
+func TestHMACIdentifyRejectsWrongKey(t *testing.T) {
+	t.Parallel()
+
+	auth1 := server.NewHMACAuth("key-1")
+	auth2 := server.NewHMACAuth("key-2")
+
+	ts := time.Unix(1_700_000_000, 0).Unix()
+	sig := auth1.SignIdentify("10.0.0.1", ts)
+
+	require.False(t, auth2.VerifyIdentify("10.0.0.1", ts, sig))
+}
+
 func TestValidateTimestamp(t *testing.T) {
 	t.Parallel()
 

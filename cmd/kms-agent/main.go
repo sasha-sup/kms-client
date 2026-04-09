@@ -68,6 +68,21 @@ func run(ctx context.Context) error {
 		Timeout: cfg.heartbeatTimeout,
 	}
 
+	if cfg.nodeUUID == "" {
+		logger.Info("NODE_UUID not set, discovering via /node/identify")
+
+		uuid, err := identifyLoop(ctx, logger, client, hmacAuth, cfg)
+		if err != nil {
+			return err
+		}
+
+		cfg.nodeUUID = uuid
+
+		logger.Info("node UUID discovered",
+			zap.String("node_uuid", cfg.nodeUUID),
+		)
+	}
+
 	return heartbeatLoop(ctx, logger, client, hmacAuth, cfg)
 }
 
@@ -79,10 +94,6 @@ func loadConfig() (agentConfig, error) {
 		hmacKey:           os.Getenv("HEARTBEAT_HMAC_KEY"),
 		heartbeatInterval: 30 * time.Second,
 		heartbeatTimeout:  5 * time.Second,
-	}
-
-	if cfg.nodeUUID == "" {
-		return agentConfig{}, fmt.Errorf("NODE_UUID environment variable is required")
 	}
 
 	if cfg.nodeIP == "" {
@@ -215,6 +226,88 @@ func sendHeartbeat(ctx context.Context, client *http.Client, hmacAuth *server.HM
 	}
 
 	return fmt.Errorf("heartbeat rejected with status %d", resp.StatusCode)
+}
+
+type identifyResponse struct {
+	NodeUUID string `json:"node_uuid"`
+	Status   string `json:"status"`
+}
+
+func identifyLoop(ctx context.Context, logger *zap.Logger, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (string, error) {
+	consecutiveFailures := 0
+
+	for {
+		uuid, err := sendIdentify(ctx, client, hmacAuth, cfg)
+		if err == nil {
+			return uuid, nil
+		}
+
+		consecutiveFailures++
+		backoff := backoffDuration(consecutiveFailures, cfg.heartbeatInterval)
+
+		logger.Warn("identify failed, retrying",
+			zap.Error(err),
+			zap.Int("consecutive_failures", consecutiveFailures),
+			zap.Duration("retry_in", backoff),
+		)
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+}
+
+func sendIdentify(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (string, error) {
+	timestamp := time.Now().Unix()
+
+	reqBody := struct {
+		NodeIP    string `json:"node_ip"`
+		Timestamp int64  `json:"timestamp"`
+	}{
+		NodeIP:    cfg.nodeIP,
+		Timestamp: timestamp,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal identify request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.kmsServerURL+"/node/identify", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("failed to create identify request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-HMAC-Signature", hmacAuth.SignIdentify(cfg.nodeIP, timestamp))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("identify request failed: %w", err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("node not yet registered (waiting for first Unseal)")
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("identify rejected with status %d", resp.StatusCode)
+	}
+
+	var identResp identifyResponse
+	if err = json.NewDecoder(resp.Body).Decode(&identResp); err != nil {
+		return "", fmt.Errorf("failed to decode identify response: %w", err)
+	}
+
+	if identResp.NodeUUID == "" {
+		return "", fmt.Errorf("server returned empty node_uuid")
+	}
+
+	return identResp.NodeUUID, nil
 }
 
 func backoffDuration(failures int, baseInterval time.Duration) time.Duration {

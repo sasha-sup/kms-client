@@ -227,6 +227,82 @@ func TestBlockedNodeCannotUnseal(t *testing.T) {
 	require.Contains(t, err.Error(), "blocked")
 }
 
+func TestIdentifyReturnsNodeUUID(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	mux, store := newTestHTTPHandler(t, func() time.Time { return now })
+
+	// Bootstrap a node so it can be found by IP.
+	_, err := store.Bootstrap("node-1", "10.0.0.1", now, 5*time.Minute)
+	require.NoError(t, err)
+
+	hmacAuth := server.NewHMACAuth(testHMACKey)
+	body, err := json.Marshal(map[string]any{
+		"node_ip":   "10.0.0.1",
+		"timestamp": now.Unix(),
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/node/identify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-HMAC-Signature", hmacAuth.SignIdentify("10.0.0.1", now.Unix()))
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, "node-1", resp["node_uuid"])
+	require.Equal(t, "active", resp["status"])
+}
+
+func TestIdentifyReturns404ForUnknownIP(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	mux, _ := newTestHTTPHandler(t, func() time.Time { return now })
+
+	hmacAuth := server.NewHMACAuth(testHMACKey)
+	body, err := json.Marshal(map[string]any{
+		"node_ip":   "10.0.0.99",
+		"timestamp": now.Unix(),
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/node/identify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-HMAC-Signature", hmacAuth.SignIdentify("10.0.0.99", now.Unix()))
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestIdentifyRejects401WithoutSignature(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	mux, _ := newTestHTTPHandler(t, func() time.Time { return now })
+
+	body, err := json.Marshal(map[string]any{
+		"node_ip":   "10.0.0.1",
+		"timestamp": now.Unix(),
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/node/identify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
 func makeHeartbeatBody(t *testing.T, nodeUUID, nodeIP string, timestamp int64) []byte {
 	t.Helper()
 

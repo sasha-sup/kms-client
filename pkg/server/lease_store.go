@@ -298,6 +298,27 @@ func (store *LeaseStore) BlockExpiredNodes(now time.Time, heartbeatTimeout time.
 	return blocked
 }
 
+// LookupByIP returns the node UUID and record for a given IP address.
+// It searches both LastUnsealIP and NodeIP fields.
+func (store *LeaseStore) LookupByIP(ip string) (string, LeaseRecord, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	nodeUUID, record, ok := store.recordByIPLocked(ip)
+	if !ok {
+		// Also try matching by NodeIP field (set by HTTP heartbeat).
+		for uuid, rec := range store.nodes {
+			if rec.NodeIP == ip {
+				return uuid, rec, nil
+			}
+		}
+
+		return "", LeaseRecord{}, ErrNodeIPNotFound
+	}
+
+	return nodeUUID, record, nil
+}
+
 func (store *LeaseStore) recordByIPLocked(peerIP string) (string, LeaseRecord, bool) {
 	for nodeUUID, record := range store.nodes {
 		if record.LastUnsealIP == peerIP {

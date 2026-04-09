@@ -121,11 +121,11 @@ func TestHeartbeatRequiresRegisteredPeerIP(t *testing.T) {
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
 }
 
-func TestUnsealRequiresRegisteredLeaseWhenHeartbeatEnabled(t *testing.T) {
+func TestFirstUnsealAllowedForUnregisteredNode(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_700_000_000, 0).UTC()
-	srv, _ := newLeaseServer(t, filepath.Join(t.TempDir(), "leases.json"), func() time.Time { return now })
+	srv, store := newLeaseServer(t, filepath.Join(t.TempDir(), "leases.json"), func() time.Time { return now })
 	passphrase := randomPassphrase(t)
 
 	encrypted, err := srv.Seal(contextWithPeerIP(t.Context(), "10.0.0.10"), &kms.Request{
@@ -134,12 +134,20 @@ func TestUnsealRequiresRegisteredLeaseWhenHeartbeatEnabled(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = srv.Unseal(contextWithPeerIP(t.Context(), "10.0.0.10"), &kms.Request{
+	// First Unseal for an unregistered node should succeed and bootstrap the lease.
+	decrypted, err := srv.Unseal(contextWithPeerIP(t.Context(), "10.0.0.10"), &kms.Request{
 		NodeUuid: testNodeUUID,
 		Data:     encrypted.Data,
 	})
-	require.Error(t, err)
-	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(passphrase, decrypted.Data))
+
+	// Verify the node was registered by Bootstrap.
+	record, ok, err := store.Get(testNodeUUID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, server.LeaseStatusActive, record.Status)
+	require.Equal(t, "10.0.0.10", record.LastUnsealIP)
 }
 
 func TestHeartbeatRefreshAllowsUnseal(t *testing.T) {
