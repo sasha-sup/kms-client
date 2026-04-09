@@ -33,14 +33,14 @@ Dead Man's Switch — механизм автоматической блокир
 ### Переменные окружения сервера
 
 | Переменная | Описание | По умолчанию |
-|---|---|---|
+| --- | --- | --- |
 | `HEARTBEAT_HMAC_KEY` | Pre-shared ключ для HMAC-SHA256 аутентификации heartbeat | **обязательно** |
 | `ADMIN_TOKEN` | Токен для admin API | **обязательно** |
 
 Флаги командной строки:
 
 | Флаг | Описание | По умолчанию |
-|---|---|---|
+| --- | --- | --- |
 | `--heartbeat-enable` | Включить dead-man's switch | `false` |
 | `--heartbeat-interval` | Ожидаемый интервал heartbeat от агентов | `30s` |
 | `--heartbeat-timeout` | Время без heartbeat до блокировки узла | `120s` |
@@ -62,11 +62,13 @@ curl -X POST http://kms-server:4051/node/identify \
 ```
 
 Ответ `200`:
+
 ```json
 {"node_uuid": "abc-123", "status": "active"}
 ```
 
 Ответ `404` (нода ещё не прошла первый Unseal):
+
 ```json
 {"error": "node_not_found"}
 ```
@@ -83,11 +85,13 @@ curl -X POST http://kms-server:4051/heartbeat \
 ```
 
 Ответ `200`:
+
 ```json
 {"status": "ok", "next_heartbeat_in": 30}
 ```
 
 Ответ `403` (узел заблокирован):
+
 ```json
 {"error": "node_blocked", "reason": "heartbeat_timeout"}
 ```
@@ -112,7 +116,7 @@ curl -X POST -H "Authorization: Bearer <token>" \
 ### Переменные окружения агента
 
 | Переменная | Описание | По умолчанию |
-|---|---|---|
+| --- | --- | --- |
 | `NODE_UUID` | UUID узла (опционально — автоопределение через `/node/identify`) | автоопределение |
 | `NODE_IP` | IP узла (из `status.podIP` в K8s) | **обязательно** |
 | `KMS_SERVER_URL` | URL HTTP API KMS-сервера | **обязательно** |

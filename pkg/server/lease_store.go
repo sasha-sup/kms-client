@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync"
@@ -41,9 +42,9 @@ type LeaseRecord struct {
 	LastUnsealAt    time.Time   `json:"last_unseal_at"`
 	LastUnsealIP    string      `json:"last_unseal_ip"`
 	Status          LeaseStatus `json:"status"`
-	FirstSeen       time.Time   `json:"first_seen,omitempty"`
+	FirstSeen       time.Time   `json:"first_seen"`
 	NodeIP          string      `json:"node_ip,omitempty"`
-	BlockedAt       time.Time   `json:"blocked_at,omitempty"`
+	BlockedAt       time.Time   `json:"blocked_at"`
 	BlockReason     string      `json:"block_reason,omitempty"`
 }
 
@@ -231,9 +232,7 @@ func (store *LeaseStore) ListAll() map[string]LeaseRecord {
 	defer store.mu.Unlock()
 
 	result := make(map[string]LeaseRecord, len(store.nodes))
-	for k, v := range store.nodes {
-		result[k] = v
-	}
+	maps.Copy(result, store.nodes)
 
 	return result
 }
@@ -292,7 +291,10 @@ func (store *LeaseStore) BlockExpiredNodes(now time.Time, heartbeatTimeout time.
 
 	if len(blocked) > 0 {
 		store.updateLeaseMetricsLocked(now)
-		_ = store.persistLocked()
+
+		if err := store.persistLocked(); err != nil {
+			store.metrics.incLeaseStoreError("block_expired_nodes")
+		}
 	}
 
 	return blocked

@@ -6,6 +6,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -15,13 +16,13 @@ import (
 
 // HTTPHandler provides HTTP endpoints for heartbeat and admin operations.
 type HTTPHandler struct {
-	leaseStore    *LeaseStore
-	hmacAuth      *HMACAuth
-	adminToken    string
-	logger        *zap.Logger
-	metrics       *Metrics
-	now           func() time.Time
-	leaseDuration time.Duration
+	leaseStore        *LeaseStore
+	hmacAuth          *HMACAuth
+	logger            *zap.Logger
+	metrics           *Metrics
+	now               func() time.Time
+	adminToken        string
+	leaseDuration     time.Duration
 	heartbeatInterval time.Duration
 }
 
@@ -29,10 +30,10 @@ type HTTPHandler struct {
 type HTTPHandlerOptions struct {
 	LeaseStore        *LeaseStore
 	HMACAuth          *HMACAuth
-	AdminToken        string
 	Logger            *zap.Logger
 	Metrics           *Metrics
 	Now               func() time.Time
+	AdminToken        string
 	LeaseDuration     time.Duration
 	HeartbeatInterval time.Duration
 }
@@ -104,22 +105,26 @@ func (h *HTTPHandler) handleIdentify(w http.ResponseWriter, r *http.Request) {
 	var req identifyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid_request"})
+
 		return
 	}
 
 	if req.NodeIP == "" || req.Timestamp == 0 {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing_fields"})
+
 		return
 	}
 
 	if !ValidateTimestamp(req.Timestamp, h.now()) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "timestamp_out_of_range"})
+
 		return
 	}
 
-	signature := r.Header.Get("X-HMAC-Signature")
+	signature := r.Header.Get("X-Hmac-Signature")
 	if signature == "" || !h.hmacAuth.VerifyIdentify(req.NodeIP, req.Timestamp, signature) {
 		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid_signature"})
+
 		return
 	}
 
@@ -149,28 +154,32 @@ func (h *HTTPHandler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var req heartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid_request"})
+
 		return
 	}
 
 	if req.NodeUUID == "" || req.NodeIP == "" || req.Timestamp == 0 {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing_fields"})
+
 		return
 	}
 
 	if !ValidateTimestamp(req.Timestamp, h.now()) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "timestamp_out_of_range"})
+
 		return
 	}
 
-	signature := r.Header.Get("X-HMAC-Signature")
+	signature := r.Header.Get("X-Hmac-Signature")
 	if signature == "" || !h.hmacAuth.Verify(req.NodeUUID, req.NodeIP, req.Timestamp, signature) {
 		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid_signature"})
+
 		return
 	}
 
 	record, err := h.leaseStore.HeartbeatByUUID(req.NodeUUID, req.NodeIP, h.now(), h.leaseDuration)
 	if err != nil {
-		if err == ErrLeaseBlocked {
+		if errors.Is(err, ErrLeaseBlocked) {
 			h.logger.Warn("rejected HTTP heartbeat for blocked node",
 				zap.String("node_uuid", req.NodeUUID),
 				zap.String("node_ip", req.NodeIP),
@@ -209,6 +218,7 @@ func (h *HTTPHandler) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPHandler) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticateAdmin(r) {
 		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid_admin_token"})
+
 		return
 	}
 
@@ -247,19 +257,22 @@ func (h *HTTPHandler) handleListNodes(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPHandler) handleUnblockNode(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticateAdmin(r) {
 		writeJSON(w, http.StatusUnauthorized, errorResponse{Error: "invalid_admin_token"})
+
 		return
 	}
 
 	uuid := r.PathValue("uuid")
 	if uuid == "" {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing_uuid"})
+
 		return
 	}
 
 	record, err := h.leaseStore.Unblock(uuid, h.now(), h.leaseDuration)
 	if err != nil {
-		if err == ErrLeaseNotFound {
+		if errors.Is(err, ErrLeaseNotFound) {
 			writeJSON(w, http.StatusNotFound, errorResponse{Error: "node_not_found"})
+
 			return
 		}
 
@@ -291,7 +304,17 @@ func (h *HTTPHandler) authenticateAdmin(r *http.Request) bool {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v) //nolint:errcheck
+
+	if _, err = w.Write(append(body, '\n')); err != nil {
+		return
+	}
 }

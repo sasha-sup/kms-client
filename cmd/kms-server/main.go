@@ -29,21 +29,21 @@ import (
 )
 
 var kmsFlags struct {
-	apiEndpoint        string
-	httpEndpoint       string
-	keyPath            string
-	leaseStorePath     string
-	metricsEndpoint    string
-	tlsCertPath        string
-	tlsKeyPath         string
-	heartbeatInterval  time.Duration
-	heartbeatTimeout   time.Duration
+	apiEndpoint            string
+	httpEndpoint           string
+	keyPath                string
+	leaseStorePath         string
+	metricsEndpoint        string
+	tlsCertPath            string
+	tlsKeyPath             string
+	heartbeatHMACKey       string
+	adminToken             string
+	heartbeatInterval      time.Duration
+	heartbeatTimeout       time.Duration
 	heartbeatCheckInterval time.Duration
-	leaseDuration      time.Duration
-	heartbeatHMACKey   string
-	adminToken         string
-	heartbeatEnable    bool
-	tlsEnable          bool
+	leaseDuration          time.Duration
+	heartbeatEnable        bool
+	tlsEnable              bool
 }
 
 func main() {

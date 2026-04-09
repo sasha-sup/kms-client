@@ -34,12 +34,14 @@ type agentConfig struct {
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
 
 	if err := run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		cancel()
 		os.Exit(1)
 	}
+
+	cancel()
 }
 
 func run(ctx context.Context) error {
@@ -149,6 +151,7 @@ func heartbeatLoop(ctx context.Context, logger *zap.Logger, client *http.Client,
 		select {
 		case <-ctx.Done():
 			logger.Info("shutting down heartbeat agent")
+
 			return nil
 		case <-ticker.C:
 		}
@@ -162,6 +165,7 @@ func heartbeatLoop(ctx context.Context, logger *zap.Logger, client *http.Client,
 			}
 
 			consecutiveFailures = 0
+
 			logger.Debug("heartbeat accepted")
 
 			continue
@@ -192,7 +196,7 @@ type heartbeatRequest struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) error {
+func sendHeartbeat(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (err error) {
 	timestamp := time.Now().Unix()
 
 	reqBody := heartbeatRequest{
@@ -212,14 +216,19 @@ func sendHeartbeat(ctx context.Context, client *http.Client, hmacAuth *server.HM
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-HMAC-Signature", hmacAuth.Sign(cfg.nodeUUID, cfg.nodeIP, timestamp))
+	req.Header.Set("X-Hmac-Signature", hmacAuth.Sign(cfg.nodeUUID, cfg.nodeIP, timestamp))
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("heartbeat request failed: %w", err)
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		closeErr := resp.Body.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("failed to close heartbeat response body: %w", closeErr)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusOK {
 		return nil
@@ -259,7 +268,7 @@ func identifyLoop(ctx context.Context, logger *zap.Logger, client *http.Client, 
 	}
 }
 
-func sendIdentify(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (string, error) {
+func sendIdentify(ctx context.Context, client *http.Client, hmacAuth *server.HMACAuth, cfg agentConfig) (nodeUUID string, err error) {
 	timestamp := time.Now().Unix()
 
 	reqBody := struct {
@@ -281,14 +290,19 @@ func sendIdentify(ctx context.Context, client *http.Client, hmacAuth *server.HMA
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-HMAC-Signature", hmacAuth.SignIdentify(cfg.nodeIP, timestamp))
+	req.Header.Set("X-Hmac-Signature", hmacAuth.SignIdentify(cfg.nodeIP, timestamp))
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("identify request failed: %w", err)
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		closeErr := resp.Body.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("failed to close identify response body: %w", closeErr)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return "", fmt.Errorf("node not yet registered (waiting for first Unseal)")

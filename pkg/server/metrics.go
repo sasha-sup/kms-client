@@ -20,13 +20,13 @@ const (
 
 // Metrics provides Prometheus metrics for the KMS server.
 type Metrics struct {
-	unsealRequests      *prometheus.CounterVec
-	heartbeatRequest    *prometheus.CounterVec
-	requestDuration     *prometheus.HistogramVec
-	activeLeases        prometheus.Gauge
-	expiredLeases       prometheus.Gauge
-	leaseStoreErrors    *prometheus.CounterVec
-	heartbeatTimeouts   prometheus.Counter
+	unsealRequests    *prometheus.CounterVec
+	heartbeatRequest  *prometheus.CounterVec
+	requestDuration   *prometheus.HistogramVec
+	activeLeases      prometheus.Gauge
+	expiredLeases     prometheus.Gauge
+	leaseStoreErrors  *prometheus.CounterVec
+	heartbeatTimeouts prometheus.Counter
 }
 
 // NewMetrics initializes KMS Prometheus metrics.

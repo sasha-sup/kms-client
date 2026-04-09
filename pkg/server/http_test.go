@@ -20,8 +20,10 @@ import (
 	"github.com/siderolabs/kms-client/pkg/server"
 )
 
-const testHMACKey = "test-secret-key"
-const testAdminToken = "test-admin-token"
+const (
+	testHMACKey    = "test-secret-key"
+	testAdminToken = "test-admin-token"
+)
 
 func newTestHTTPHandler(t *testing.T, now func() time.Time) (*http.ServeMux, *server.LeaseStore) {
 	t.Helper()
@@ -63,7 +65,7 @@ func TestHTTPHeartbeatActiveNode(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/heartbeat", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-HMAC-Signature", sig)
+	req.Header.Set("X-Hmac-Signature", sig)
 
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -96,7 +98,7 @@ func TestHTTPHeartbeatBlockedNodeReturns403(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/heartbeat", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-HMAC-Signature", sig)
+	req.Header.Set("X-Hmac-Signature", sig)
 
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -118,7 +120,7 @@ func TestHTTPHeartbeatInvalidSignatureReturns401(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/heartbeat", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-HMAC-Signature", "invalid-signature")
+	req.Header.Set("X-Hmac-Signature", "invalid-signature")
 
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -160,6 +162,7 @@ func TestAdminUnblockWithTokenSucceeds(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/nodes/node-1/unblock", nil)
 	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -186,6 +189,7 @@ func TestAdminListNodes(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/nodes", nil)
 	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -246,7 +250,7 @@ func TestIdentifyReturnsNodeUUID(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/node/identify", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-HMAC-Signature", hmacAuth.SignIdentify("10.0.0.1", now.Unix()))
+	req.Header.Set("X-Hmac-Signature", hmacAuth.SignIdentify("10.0.0.1", now.Unix()))
 
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -274,7 +278,7 @@ func TestIdentifyReturns404ForUnknownIP(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/node/identify", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-HMAC-Signature", hmacAuth.SignIdentify("10.0.0.99", now.Unix()))
+	req.Header.Set("X-Hmac-Signature", hmacAuth.SignIdentify("10.0.0.99", now.Unix()))
 
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)

@@ -62,6 +62,7 @@ func (d *DeadManSwitch) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			d.logger.Info("dead-man's switch stopped")
+
 			return nil
 		case <-ticker.C:
 			d.Check()
