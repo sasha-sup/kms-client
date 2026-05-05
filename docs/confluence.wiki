@@ -35,11 +35,12 @@ h3. Порядок работы
 
 h3. Nginx Reverse Proxy
 
-KMS-сервер работает за nginx, который терминирует TLS и проксирует gRPC. Nginx передаёт заголовок {{X-Real-IP}}, а сервер извлекает реальный IP узла из gRPC metadata (с fallback на peer address). Конфигурация разворачивается через Ansible-роль [talos-kms|https://gl.pypypy.py/devops/iac/-/tree/main/ansible/roles/talos-kms].
+KMS-сервер работает за nginx, который терминирует TLS и проксирует gRPC. Nginx передаёт заголовок {{X-Real-IP}}, а сервер извлекает реальный IP узла из gRPC metadata (с fallback на peer address). Конфигурация разворачивается через Ansible-роль [talos-kms|https://gl.brooklyn.wf/devops/iac/-/tree/main/ansible/roles/talos-kms].
 
 h2. Мониторинг (Grafana)
 
-
+Дашборд: [KMS Server|https://grafana.k8s-0.brooklyn.wf/d/kms-server-overview]
+Исходник: {{devops/helm-infra/monitoring/grafana-dashboards-chart/dashboards/kms-dashboard.json}}
 
 Дашборд обновляется каждые 30 секунд, источник данных — VictoriaMetrics. Переменные фильтрации: {{job}}, {{instance}}.
 
@@ -73,7 +74,7 @@ h3. Переменные окружения
 |{{HEARTBEAT_HMAC_KEY}}|Pre-shared ключ HMAC-SHA256|Да (при heartbeat)|
 |{{ADMIN_TOKEN}}|Токен для admin API|Да (при heartbeat)|
 
-Секреты зашифрованы через ansible-vault и хранятся в [devops/iac/ansible/roles/talos-kms|https://gl.pypypy.py/devops/iac/-/tree/main/ansible/roles/talos-kms] ({{vars/vault.yml}}).
+Секреты зашифрованы через ansible-vault и хранятся в [devops/iac/ansible/roles/talos-kms|https://gl.brooklyn.wf/devops/iac/-/tree/main/ansible/roles/talos-kms] ({{vars/vault.yml}}).
 SSH-ключ деплоя и пароль ansible-vault продублированы в Hashicorp Vault.
 
 h3. Бэкап master.key
@@ -228,7 +229,7 @@ h3. Пайплайн devops/iac
 # Запускает {{ansible-playbook talos-kms.yml}} — копирует бинарник на сервер и перезапускает сервис
 
 Образ: {{cytopia/ansible:latest-tools}}. Раннер: {{talos-k8s}} (Kubernetes).
-SSH-подключение к {{kms.mgmt.pypypy.py}} под пользователем {{ansible}} (sudo, NOPASSWD).
+SSH-подключение к {{kms.mgmt.brooklyn.wf}} под пользователем {{ansible}} (sudo, NOPASSWD).
 
 h3. Версионирование
 
@@ -247,7 +248,7 @@ h3. CI-переменные
 |{{IAC_TRIGGER_TOKEN}}|Trigger token для запуска пайплайна devops/iac|
 |{{IAC_PROJECT_ID}}|ID проекта devops/iac (захардкожен: {{6}})|
 |{{KMS_ADMIN_TOKEN}}|Токен admin API для ручных KMS jobs; хранится в CI/CD variables проекта|
-|{{KMS_BASE_URL}}|Базовый URL admin API, по умолчанию {{https://kms.mgmt.pypypy.py}}|
+|{{KMS_BASE_URL}}|Базовый URL admin API, по умолчанию {{https://kms.mgmt.brooklyn.wf}}|
 |{{KMS_NODE}}|UUID или hostname узла для jobs {{kms_unblock_node}}, {{kms_maintenance_on}}, {{kms_maintenance_off}}|
 
 {info}*devops/iac:*{info}
@@ -287,7 +288,7 @@ h3. kms-server
 Автоматический деплой при пуше в main:
 # CI собирает бинарник и публикует в Package Registry
 # Trigger запускает пайплайн в devops/iac
-# Ansible скачивает бинарник из Registry и деплоит на {{kms.mgmt.pypypy.py}}
+# Ansible скачивает бинарник из Registry и деплоит на {{kms.mgmt.brooklyn.wf}}
 
 Ручной деплой через Ansible:
 {code:language=bash}

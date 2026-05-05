@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-BASE_URL="${KMS_BASE_URL:-}"
+BASE_URL="${KMS_BASE_URL:-https://kms.mgmt.brooklyn.wf}"
 TOKEN="${KMS_ADMIN_TOKEN:-}"
 
 usage() {
@@ -17,7 +17,7 @@ Usage:
 
 Environment:
   KMS_ADMIN_TOKEN  Required admin token for KMS admin API
-  KMS_BASE_URL     Optional base URL
+  KMS_BASE_URL     Optional base URL, default: https://kms.mgmt.brooklyn.wf
 
 Examples:
   KMS_ADMIN_TOKEN=... ./scripts/kms-admin.sh list
